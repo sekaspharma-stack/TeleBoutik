@@ -1,6 +1,6 @@
 import { query, queryOne, execute, generateId, now } from './localDb';
 
-const SEED_FLAG_KEY = 'seed_v1_done';
+const SEED_FLAG_KEY = 'seed_v2_done';
 
 async function isSeeded(): Promise<boolean> {
   const row = await queryOne<{ value: string }>("SELECT value FROM app_meta WHERE key = $1", [SEED_FLAG_KEY]);
@@ -110,7 +110,7 @@ export async function seedDemoData(): Promise<void> {
   // Phones
   const phoneProducts: Array<{ productId: string; variantId: string; purchasePrice: number; salePrice: number; brand: string; model: string }> = [];
   let phonesCreated = 0;
-  while (phonesCreated < 60) {
+  while (phonesCreated < 20) {
     for (const b of phoneBrands) {
       if (phonesCreated >= 60) break;
       for (const model of b.models) {
@@ -160,7 +160,7 @@ export async function seedDemoData(): Promise<void> {
 
   // Accessories (300 variants)
   let accessoryCount = 0;
-  while (accessoryCount < 300) {
+  while (accessoryCount < 60) {
     for (const at of accessoryTypes) {
       for (const model of at.models) {
         if (accessoryCount >= 300) break;
@@ -236,8 +236,8 @@ export async function seedDemoData(): Promise<void> {
 
   const paymentMethods = ['cash', 'orange_money', 'mtn_momo', 'wave', 'cash', 'cash', 'cash', 'card'];
 
-  for (let day = 30; day >= 1; day--) {
-    const salesPerDay = Math.floor(Math.random() * 5) + 2;
+  for (let day = 15; day >= 1; day--) {
+    const salesPerDay = Math.floor(Math.random() * 3) + 1;
     for (let s = 0; s < salesPerDay; s++) {
       const saleId = generateId();
       const dateStr = randomDate(day);
