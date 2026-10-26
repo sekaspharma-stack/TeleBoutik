@@ -1,6 +1,6 @@
 import { create } from 'zustand';
 import { query } from '../db/localDb';
-import { syncPendingOps, isSyncing, type SyncProgress } from '../db/syncEngine';
+import { syncPendingOps, isSyncing, pullCloudData, type SyncProgress } from '../db/syncEngine';
 
 interface SyncState {
   isOnline: boolean;
@@ -27,6 +27,7 @@ export const useSync = create<SyncState>((set, get) => ({
     if (online) {
       void get().refreshPendingCount().then(() => {
         if (get().pendingCount > 0) void get().triggerSync();
+        else void pullCloudData();
       });
     }
   },
@@ -52,6 +53,7 @@ export const useSync = create<SyncState>((set, get) => ({
         lastSyncResult: { synced: result.synced, failed: result.failed, errors: result.errors },
       });
       await get().refreshPendingCount();
+      if (result.synced > 0) await pullCloudData();
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       set({ lastSyncResult: { synced: 0, failed: 1, errors: [message] } });
@@ -64,7 +66,6 @@ export const useSync = create<SyncState>((set, get) => ({
 let watcherCleanup: (() => void) | null = null;
 
 export function initSyncWatcher() {
-  // React StrictMode / hot reload can initialize this more than once.
   watcherCleanup?.();
 
   const goOnline = () => {

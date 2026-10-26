@@ -38,6 +38,7 @@ export default defineConfig({
   ],
   optimizeDeps: {
     exclude: ['@electric-sql/pglite'],
+    include: ['firebase/app', 'firebase/firestore'],
   },
   build: {
     target: 'es2020',

@@ -1,4 +1,14 @@
-import { supabase, isSupabaseConfigured } from './supabaseClient';
+import { db, isFirebaseConfigured } from './firebaseClient';
+import {
+  doc,
+  setDoc,
+  updateDoc,
+  writeBatch,
+  collection,
+  getDocs,
+  serverTimestamp,
+  type WriteBatch,
+} from 'firebase/firestore';
 import { query, execute } from './localDb';
 import type { SyncOp, Sale, SaleLine, SalePayment, StockMovement, CashMovement, JournalEntry, AuditLog } from '../types';
 
@@ -9,12 +19,29 @@ type SyncResult = {
 };
 
 async function upsertSale(recordId: string, data: Sale): Promise<void> {
-  const { error } = await supabase.from('sales').upsert({
+  const lines = await query<SaleLine>('SELECT * FROM sale_lines WHERE sale_id = $1', [recordId]);
+  const payments = await query<SalePayment>('SELECT * FROM sale_payments WHERE sale_id = $1', [recordId]);
+  const stockMvts = await query<StockMovement>(
+    "SELECT * FROM stock_movements WHERE reference_id = $1 AND reference_type IN ('sale','sale_cancel')",
+    [recordId]
+  );
+  const cashMvts = await query<CashMovement>(
+    "SELECT * FROM cash_movements WHERE reference_id = $1",
+    [recordId]
+  );
+  const journalEntries = await query<JournalEntry>(
+    "SELECT * FROM journal_entries WHERE reference_id = $1",
+    [recordId]
+  );
+
+  const batch: WriteBatch = writeBatch(db);
+
+  batch.set(doc(db, 'sales', data.id), {
     id: data.id,
     ticket_number: data.ticket_number,
     store_id: data.store_id,
     user_id: data.user_id,
-    customer_id: data.customer_id,
+    customer_id: data.customer_id ?? null,
     subtotal: data.subtotal,
     discount: data.discount,
     tax_amount: data.tax_amount,
@@ -22,17 +49,16 @@ async function upsertSale(recordId: string, data: Sale): Promise<void> {
     total_cost: data.total_cost,
     status: data.status,
     sale_date: data.sale_date,
-    notes: data.notes,
+    notes: data.notes ?? null,
+    synced_at: serverTimestamp(),
   });
-  if (error) throw new Error(`sales: ${error.message}`);
 
-  const lines = await query<SaleLine>('SELECT * FROM sale_lines WHERE sale_id = $1', [recordId]);
   for (const line of lines) {
-    const { error: le } = await supabase.from('sale_lines').upsert({
+    batch.set(doc(db, 'sale_lines', line.id), {
       id: line.id,
       sale_id: line.sale_id,
       variant_id: line.variant_id,
-      imei_unit_id: line.imei_unit_id,
+      imei_unit_id: line.imei_unit_id ?? null,
       product_name: line.product_name,
       quantity: line.quantity,
       unit_price: line.unit_price,
@@ -40,49 +66,37 @@ async function upsertSale(recordId: string, data: Sale): Promise<void> {
       discount: line.discount,
       line_total: line.line_total,
     });
-    if (le) throw new Error(`sale_lines: ${le.message}`);
   }
 
-  const payments = await query<SalePayment>('SELECT * FROM sale_payments WHERE sale_id = $1', [recordId]);
   for (const p of payments) {
-    const { error: pe } = await supabase.from('sale_payments').upsert({
+    batch.set(doc(db, 'sale_payments', p.id), {
       id: p.id,
       sale_id: p.sale_id,
       payment_method: p.payment_method,
       amount: p.amount,
-      reference: p.reference,
+      reference: p.reference ?? null,
     });
-    if (pe) throw new Error(`sale_payments: ${pe.message}`);
   }
 
-  const stockMvts = await query<StockMovement>(
-    "SELECT * FROM stock_movements WHERE reference_id = $1 AND reference_type IN ('sale','sale_cancel')",
-    [recordId]
-  );
   for (const sm of stockMvts) {
-    const { error: se } = await supabase.from('stock_movements').upsert({
+    batch.set(doc(db, 'stock_movements', sm.id), {
       id: sm.id,
       variant_id: sm.variant_id,
-      imei_unit_id: sm.imei_unit_id,
+      imei_unit_id: sm.imei_unit_id ?? null,
       movement_type: sm.movement_type,
       direction: sm.direction,
       quantity: sm.quantity,
       unit_cost: sm.unit_cost,
       reference_type: sm.reference_type,
-      reference_id: sm.reference_id,
+      reference_id: sm.reference_id ?? null,
       user_id: sm.user_id,
       reason: sm.reason,
       created_at: sm.created_at,
     });
-    if (se) throw new Error(`stock_movements: ${se.message}`);
   }
 
-  const cashMvts = await query<CashMovement>(
-    "SELECT * FROM cash_movements WHERE reference_id = $1",
-    [recordId]
-  );
   for (const cm of cashMvts) {
-    const { error: ce } = await supabase.from('cash_movements').upsert({
+    batch.set(doc(db, 'cash_movements', cm.id), {
       id: cm.id,
       cash_session_id: cm.cash_session_id,
       movement_type: cm.movement_type,
@@ -90,20 +104,15 @@ async function upsertSale(recordId: string, data: Sale): Promise<void> {
       amount: cm.amount,
       direction: cm.direction,
       reference_type: cm.reference_type,
-      reference_id: cm.reference_id,
+      reference_id: cm.reference_id ?? null,
       user_id: cm.user_id,
       reason: cm.reason,
       created_at: cm.created_at,
     });
-    if (ce) throw new Error(`cash_movements: ${ce.message}`);
   }
 
-  const journalEntries = await query<JournalEntry>(
-    "SELECT * FROM journal_entries WHERE reference_id = $1",
-    [recordId]
-  );
   for (const je of journalEntries) {
-    const { error: jee } = await supabase.from('journal_entries').upsert({
+    batch.set(doc(db, 'journal_entries', je.id), {
       id: je.id,
       date: je.date,
       account_debit: je.account_debit,
@@ -115,16 +124,16 @@ async function upsertSale(recordId: string, data: Sale): Promise<void> {
       user_id: je.user_id,
       created_at: je.created_at,
     });
-    if (jee) throw new Error(`journal_entries: ${jee.message}`);
   }
+
+  await batch.commit();
 }
 
-async function cancelSaleCloud(recordId: string, data: { reason: string }): Promise<void> {
-  const { error } = await supabase
-    .from('sales')
-    .update({ status: 'cancelled' })
-    .eq('id', recordId);
-  if (error) throw new Error(`cancel sale: ${error.message}`);
+async function cancelSaleCloud(recordId: string): Promise<void> {
+  await updateDoc(doc(db, 'sales', recordId), {
+    status: 'cancelled',
+    synced_at: serverTimestamp(),
+  });
 }
 
 async function syncEntity(entity: string, operation: string, recordId: string, rawData: string): Promise<void> {
@@ -135,12 +144,12 @@ async function syncEntity(entity: string, operation: string, recordId: string, r
       if (operation === 'insert') {
         await upsertSale(recordId, data as Sale);
       } else if (operation === 'cancel') {
-        await cancelSaleCloud(recordId, data as { reason: string });
+        await cancelSaleCloud(recordId);
       }
       break;
 
     case 'customers': {
-      const { error } = await supabase.from('customers').upsert({
+      await setDoc(doc(db, 'customers', data.id), {
         id: data.id,
         name: data.name,
         phone: data.phone ?? '',
@@ -148,13 +157,13 @@ async function syncEntity(entity: string, operation: string, recordId: string, r
         credit_limit: data.credit_limit ?? 50000,
         outstanding_balance: data.outstanding_balance ?? 0,
         created_at: data.created_at,
+        synced_at: serverTimestamp(),
       });
-      if (error) throw new Error(`customers: ${error.message}`);
       break;
     }
 
     case 'products': {
-      const { error } = await supabase.from('products').upsert({
+      await setDoc(doc(db, 'products', data.id), {
         id: data.id,
         store_id: data.store_id ?? null,
         brand: data.brand,
@@ -165,12 +174,12 @@ async function syncEntity(entity: string, operation: string, recordId: string, r
         is_serialized: data.is_serialized ?? false,
         created_at: data.created_at,
         updated_at: data.updated_at,
+        synced_at: serverTimestamp(),
       });
-      if (error) throw new Error(`products: ${error.message}`);
 
       if (data.variant) {
         const v = data.variant;
-        const { error: ve } = await supabase.from('product_variants').upsert({
+        await setDoc(doc(db, 'product_variants', v.id), {
           id: v.id,
           product_id: v.product_id,
           sku: v.sku,
@@ -183,14 +192,14 @@ async function syncEntity(entity: string, operation: string, recordId: string, r
           max_stock: v.max_stock ?? 100,
           created_at: v.created_at,
           updated_at: v.updated_at,
+          synced_at: serverTimestamp(),
         });
-        if (ve) throw new Error(`product_variants: ${ve.message}`);
       }
       break;
     }
 
     case 'cash_session': {
-      const { error } = await supabase.from('cash_sessions').upsert({
+      await setDoc(doc(db, 'cash_sessions', data.id), {
         id: data.id,
         store_id: data.store_id,
         user_id: data.user_id,
@@ -203,13 +212,13 @@ async function syncEntity(entity: string, operation: string, recordId: string, r
         opened_at: data.opened_at,
         closed_at: data.closed_at ?? null,
         notes: data.notes ?? null,
+        synced_at: serverTimestamp(),
       });
-      if (error) throw new Error(`cash_sessions: ${error.message}`);
       break;
     }
 
     case 'user': {
-      const { error } = await supabase.from('app_users').upsert({
+      await setDoc(doc(db, 'app_users', data.id), {
         id: data.id,
         store_id: data.store_id ?? null,
         name: data.name,
@@ -219,8 +228,8 @@ async function syncEntity(entity: string, operation: string, recordId: string, r
         commission_rate: data.commission_rate ?? 0,
         fixed_salary: data.fixed_salary ?? 0,
         created_at: data.created_at,
+        synced_at: serverTimestamp(),
       });
-      if (error) throw new Error(`app_users: ${error.message}`);
       break;
     }
 
@@ -233,7 +242,7 @@ async function syncEntity(entity: string, operation: string, recordId: string, r
     [entity, recordId]
   );
   for (const al of auditLogs) {
-    const { error: ae } = await supabase.from('audit_log').upsert({
+    await setDoc(doc(db, 'audit_log', al.id), {
       id: al.id,
       user_id: al.user_id,
       user_role: al.user_role,
@@ -244,8 +253,8 @@ async function syncEntity(entity: string, operation: string, recordId: string, r
       prev_hash: al.prev_hash,
       hash: al.hash,
       created_at: al.created_at,
+      synced_at: serverTimestamp(),
     });
-    if (ae) throw new Error(`audit_log: ${ae.message}`);
   }
 }
 
@@ -254,8 +263,8 @@ let syncing = false;
 export type SyncProgress = { completed: number; total: number; current: string | null };
 
 export async function syncPendingOps(onProgress?: (progress: SyncProgress) => void): Promise<SyncResult> {
-  if (!isSupabaseConfigured) {
-    return { synced: 0, failed: 0, errors: ['Supabase non configuré'] };
+  if (!isFirebaseConfigured) {
+    return { synced: 0, failed: 0, errors: ['Firebase non configuré'] };
   }
   if (syncing) return { synced: 0, failed: 0, errors: [] };
   if (!navigator.onLine) return { synced: 0, failed: 0, errors: [] };
@@ -302,4 +311,33 @@ export async function syncPendingOps(onProgress?: (progress: SyncProgress) => vo
 
 export function isSyncing(): boolean {
   return syncing;
+}
+
+export async function pullCloudData(): Promise<void> {
+  if (!isFirebaseConfigured || !navigator.onLine) return;
+
+  const collections = ['stores', 'app_users', 'products', 'product_variants', 'customers', 'suppliers'];
+  for (const collName of collections) {
+    const snap = await getDocs(collection(db, collName));
+    for (const docSnap of snap.docs) {
+      const data = docSnap.data();
+      const tableName = collName === 'app_users' ? 'users' : collName;
+      const cols = Object.keys(data).filter((k) => k !== 'synced_at');
+      const placeholders = cols.map((_, i) => `$${i + 1}`).join(', ');
+      const values = cols.map((k) => {
+        const v = data[k];
+        if (v && typeof v === 'object' && !Array.isArray(v)) return JSON.stringify(v);
+        return v ?? null;
+      });
+      try {
+        await execute(
+          `INSERT INTO ${tableName} (${cols.join(', ')}) VALUES (${placeholders})
+           ON CONFLICT (id) DO NOTHING`,
+          values
+        );
+      } catch {
+        // table schema may differ; skip on error
+      }
+    }
+  }
 }
