@@ -1,0 +1,4 @@
+# Keep Netlify secret scanning enabled while excluding Firebase client configuration keys.
+# These Firebase values are intended for use by the browser SDK.
+[build.environment]
+  SECRETS_SCAN_OMIT_KEYS = "apiKey,authDomain,projectId,storageBucket,messagingSenderId,appId,measurementId"
