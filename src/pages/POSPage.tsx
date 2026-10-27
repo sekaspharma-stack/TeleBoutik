@@ -1,0 +1,629 @@
+import { useState, useEffect, useMemo, useCallback } from 'react';
+import { Search, Scan, Trash2, ShoppingCart, User, X, Plus, Minus, Printer, Check, Tag } from 'lucide-react';
+import { useCart } from '../context/CartContext';
+import { useAuth } from '../context/AuthContext';
+import { query, queryOne } from '../db/localDb';
+import { completeSale, cancelSale } from '../db/saleService';
+import { addAuditLog, addSyncOp } from '../db/audit';
+import { generateId, now, execute } from '../db/localDb';
+import { formatCurrency, paymentLabel, maxDiscount } from '../lib/utils';
+import type { Product, ProductVariant, ImeiUnit, Customer, SalePayment } from '../types';
+import TicketModal from '../components/TicketModal';
+
+interface SearchResult {
+  product: Product;
+  variant: ProductVariant;
+  stock_qty: number;
+  imei_available: number;
+}
+
+const PAYMENT_METHODS = [
+  { value: 'cash', label: 'Espèces' },
+  { value: 'orange_money', label: 'Orange Money' },
+  { value: 'mtn_momo', label: 'MTN MoMo' },
+  { value: 'wave', label: 'Wave' },
+  { value: 'card', label: 'Carte' },
+  { value: 'transfer', label: 'Virement' },
+  { value: 'credit', label: 'Crédit' },
+] as const;
+
+export default function POSPage() {
+  const { user, store, cashSession, setCashSession } = useAuth();
+  const cart = useCart();
+  const [searchQuery, setSearchQuery] = useState('');
+  const [results, setResults] = useState<SearchResult[]>([]);
+  const [showPayment, setShowPayment] = useState(false);
+  const [showTicket, setShowTicket] = useState<string | null>(null);
+  const [scanMode, setScanMode] = useState(false);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
+  const [showCustomerPicker, setShowCustomerPicker] = useState(false);
+
+  const currency = store?.currency ?? 'XOF';
+  const decimals = store?.currency_decimals ?? 0;
+  const maxDisc = user ? maxDiscount(user.role, store?.max_seller_discount ?? 5, store?.max_manager_discount ?? 10) : 0;
+
+  const doSearch = useCallback(async (q: string) => {
+    if (!q.trim()) {
+      setResults([]);
+      return;
+    }
+    const pattern = `%${q.toLowerCase()}%`;
+    const rows = await query<SearchResult>(
+      `SELECT p.*, pv.*,
+         p.id as product_id,
+         pv.id as variant_id,
+         COALESCE(
+           (SELECT SUM(CASE WHEN direction='in' THEN quantity ELSE -quantity END) FROM stock_movements WHERE variant_id = pv.id AND movement_type != 'sale' OR movement_type = 'sale'),
+           0
+         ) as stock_qty,
+         (SELECT COUNT(*) FROM imei_units WHERE variant_id = pv.id AND lifecycle_status = 'in_stock') as imei_available
+       FROM products p
+       JOIN product_variants pv ON pv.product_id = p.id
+       WHERE LOWER(p.brand) LIKE $1 OR LOWER(p.model) LIKE $1 OR LOWER(pv.sku) LIKE $1 OR LOWER(pv.barcode) LIKE $1
+       ORDER BY p.brand, p.model
+       LIMIT 30`,
+      [pattern]
+    );
+    setResults(rows);
+  }, []);
+
+  useEffect(() => {
+    const timer = setTimeout(() => doSearch(searchQuery), 200);
+    return () => clearTimeout(timer);
+  }, [searchQuery, doSearch]);
+
+  const handleBarcodeSearch = async () => {
+    if (!searchQuery.trim()) return;
+    const imeiMatch = await queryOne<{ pv_id: string; iu_id: string; imei1: string; p_id: string }>(
+      `SELECT pv.id as pv_id, iu.id as iu_id, iu.imei1, pv.product_id as p_id
+       FROM imei_units iu
+       JOIN product_variants pv ON pv.id = iu.variant_id
+       WHERE iu.imei1 = $1 AND iu.lifecycle_status = 'in_stock'`,
+      [searchQuery.trim()]
+    );
+    if (imeiMatch) {
+      const product = await queryOne<Product>('SELECT * FROM products WHERE id = $1', [imeiMatch.p_id]);
+      const variant = await queryOne<ProductVariant>('SELECT * FROM product_variants WHERE id = $1', [imeiMatch.pv_id]);
+      if (product && variant) {
+        cart.addItem(product, variant, imeiMatch.iu_id, imeiMatch.imei1);
+        setSearchQuery('');
+        setScanMode(false);
+        return;
+      }
+    }
+    const barcodeMatch = await queryOne<{ p_id: string; pv_id: string }>(
+      `SELECT pv.product_id as p_id, pv.id as pv_id FROM product_variants pv WHERE pv.barcode = $1 OR pv.sku = $1`,
+      [searchQuery.trim()]
+    );
+    if (barcodeMatch) {
+      const product = await queryOne<Product>('SELECT * FROM products WHERE id = $1', [barcodeMatch.p_id]);
+      const variant = await queryOne<ProductVariant>('SELECT * FROM product_variants WHERE id = $1', [barcodeMatch.pv_id]);
+      if (product && variant) {
+        if (product.is_serialized) {
+          const imei = await queryOne<ImeiUnit>(
+            `SELECT * FROM imei_units WHERE variant_id = $1 AND lifecycle_status = 'in_stock' LIMIT 1`,
+            [variant.id]
+          );
+          if (imei) {
+            cart.addItem(product, variant, imei.id, imei.imei1);
+          } else {
+            setError('Aucun IMEI en stock pour ce modèle');
+          }
+        } else {
+          cart.addItem(product, variant);
+        }
+        setSearchQuery('');
+        setScanMode(false);
+      }
+    }
+  };
+
+  const handleAddProduct = async (result: SearchResult) => {
+    setError('');
+    if (result.product.is_serialized) {
+      const imei = await queryOne<ImeiUnit>(
+        `SELECT * FROM imei_units WHERE variant_id = $1 AND lifecycle_status = 'in_stock' LIMIT 1`,
+        [result.variant.id]
+      );
+      if (!imei) {
+        setError(`Aucun IMEI en stock pour ${result.product.brand} ${result.product.model}`);
+        return;
+      }
+      cart.addItem(result.product, result.variant, imei.id, imei.imei1);
+    } else {
+      cart.addItem(result.product, result.variant);
+    }
+  };
+
+  const handleCheckout = async () => {
+    if (!user || !store) return;
+    if (!cashSession) {
+      setError('Veuillez ouvrir une session de caisse d\'abord');
+      return;
+    }
+    if (cart.items.length === 0) return;
+    setShowPayment(true);
+  };
+
+  if (!user || !store) return null;
+
+  return (
+    <div className="flex flex-col lg:flex-row gap-4 lg:h-[calc(100vh-60px)]">
+      <div className="flex-1 flex flex-col min-h-[50vh] lg:min-h-0">
+        <div className="mb-3">
+          <div className="relative">
+            <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-5 h-5 text-slate-400" />
+            <input
+              type="text"
+              value={searchQuery}
+              onChange={(e) => setSearchQuery(e.target.value)}
+              onKeyDown={(e) => e.key === 'Enter' && handleBarcodeSearch()}
+              placeholder="Rechercher par nom, SKU, code-barres ou scanner IMEI..."
+              className="input pl-10 pr-12 text-base"
+              autoFocus
+            />
+            <button
+              onClick={() => { setScanMode(!scanMode); if (!scanMode) setSearchQuery(''); }}
+              className={`absolute right-2 top-1/2 -translate-y-1/2 p-1.5 rounded-lg transition-colors ${scanMode ? 'bg-primary-100 text-primary-600' : 'text-slate-400 hover:bg-slate-100'}`}
+            >
+              <Scan className="w-5 h-5" />
+            </button>
+          </div>
+          {error && (
+            <p className="text-error-600 text-sm mt-2 animate-fade-in">{error}</p>
+          )}
+        </div>
+
+        <div className="flex-1 overflow-y-auto">
+          {results.length > 0 ? (
+            <div className="grid grid-cols-2 lg:grid-cols-3 gap-2">
+              {results.map((r) => (
+                <button
+                  key={r.variant.id}
+                  onClick={() => handleAddProduct(r)}
+                  className="card p-3 text-left hover:border-primary-300 hover:shadow-md transition-all active:scale-95"
+                >
+                  <div className="flex items-start justify-between mb-1">
+                    <span className="text-xs font-medium text-primary-600">{r.product.brand}</span>
+                    {r.product.is_serialized ? (
+                      r.imei_available > 0 ? (
+                        <span className="badge-success">{r.imei_available} en stock</span>
+                      ) : (
+                        <span className="badge-error">Rupture</span>
+                      )
+                    ) : (
+                      <span className={r.stock_qty > 0 ? 'badge-success' : 'badge-error'}>
+                        {r.stock_qty > 0 ? `${r.stock_qty} en stock` : 'Rupture'}
+                      </span>
+                    )}
+                  </div>
+                  <p className="text-sm font-medium text-slate-800 truncate">
+                    {r.product.model}
+                  </p>
+                  <p className="text-xs text-slate-400 truncate">
+                    {r.variant.attributes && typeof r.variant.attributes === 'object'
+                      ? Object.entries(r.variant.attributes as Record<string, string>).map(([k, v]) => v).join(' · ')
+                      : ''}
+                  </p>
+                  <p className="text-base font-bold text-slate-900 mt-1">
+                    {formatCurrency(r.variant.sale_price, currency, decimals)}
+                  </p>
+                </button>
+              ))}
+            </div>
+          ) : (
+            !searchQuery && (
+              <div className="flex flex-col items-center justify-center h-full text-slate-400">
+                <ShoppingCart className="w-16 h-16 mb-3 opacity-30" />
+                <p className="text-sm">Recherchez un produit ou scannez un code-barres</p>
+                <p className="text-xs mt-1">{cart.items.length} article(s) dans le panier</p>
+              </div>
+            )
+          )}
+        </div>
+      </div>
+
+      <div className="w-full lg:w-96 flex flex-col bg-white rounded-xl border border-slate-200 shadow-sm lg:max-h-full max-h-[40vh] lg:max-h-none shrink-0">
+        <div className="p-3 border-b border-slate-200">
+          <div className="flex items-center justify-between mb-2">
+            <h2 className="font-semibold text-slate-800 flex items-center gap-2">
+              <ShoppingCart className="w-5 h-5 text-primary-600" />
+              Panier ({cart.items.length})
+            </h2>
+            {cart.items.length > 0 && (
+              <button onClick={() => cart.clear()} className="text-xs text-slate-400 hover:text-error-600">
+                Vider
+              </button>
+            )}
+          </div>
+          <button
+            onClick={() => setShowCustomerPicker(true)}
+            className="w-full flex items-center gap-2 px-3 py-2 bg-slate-50 rounded-lg text-sm text-slate-600 hover:bg-slate-100 transition-colors"
+          >
+            <User className="w-4 h-4" />
+            {cart.customerName || 'Client de passage'}
+          </button>
+        </div>
+
+        <div className="flex-1 overflow-y-auto p-3 space-y-2">
+          {cart.items.length === 0 ? (
+            <div className="flex flex-col items-center justify-center h-full text-slate-300">
+              <Tag className="w-10 h-10 mb-2" />
+              <p className="text-sm">Panier vide</p>
+            </div>
+          ) : (
+            cart.items.map((item) => (
+              <div key={item.key} className="bg-slate-50 rounded-lg p-2.5">
+                <div className="flex items-start justify-between gap-2">
+                  <div className="flex-1 min-w-0">
+                    <p className="text-sm font-medium text-slate-800 truncate">
+                      {item.product.brand} {item.product.model}
+                    </p>
+                    <p className="text-xs text-slate-400">
+                      {item.imei1 ? `IMEI: ${item.imei1}` : item.variant.sku}
+                    </p>
+                  </div>
+                  <button
+                    onClick={() => cart.removeItem(item.key)}
+                    className="text-slate-300 hover:text-error-600 p-1"
+                  >
+                    <Trash2 className="w-4 h-4" />
+                  </button>
+                </div>
+                <div className="flex items-center gap-2 mt-2">
+                  {!item.isSerialized && (
+                    <div className="flex items-center gap-1">
+                      <button
+                        onClick={() => cart.updateQuantity(item.key, item.quantity - 1)}
+                        className="w-7 h-7 rounded bg-white border border-slate-200 flex items-center justify-center text-slate-500 hover:bg-slate-100"
+                      >
+                        <Minus className="w-3 h-3" />
+                      </button>
+                      <span className="w-8 text-center text-sm font-medium">{item.quantity}</span>
+                      <button
+                        onClick={() => cart.updateQuantity(item.key, item.quantity + 1)}
+                        className="w-7 h-7 rounded bg-white border border-slate-200 flex items-center justify-center text-slate-500 hover:bg-slate-100"
+                      >
+                        <Plus className="w-3 h-3" />
+                      </button>
+                    </div>
+                  )}
+                  {item.isSerialized && (
+                    <span className="badge-primary text-[10px]">Unité unique</span>
+                  )}
+                  <div className="flex-1 text-right">
+                    <input
+                      type="number"
+                      value={item.unitPrice}
+                      onChange={(e) => cart.updatePrice(item.key, parseFloat(e.target.value) || 0)}
+                      className="w-20 text-right text-sm border border-slate-200 rounded px-1 py-0.5"
+                    />
+                    <span className="text-xs text-slate-400 ml-1">{currency}</span>
+                  </div>
+                </div>
+                <div className="flex items-center justify-between mt-1.5">
+                  <span className="text-sm font-semibold text-slate-800">
+                    {formatCurrency(item.unitPrice * item.quantity - item.discount, currency, decimals)}
+                  </span>
+                  <input
+                    type="number"
+                    placeholder="Remise"
+                    value={item.discount || ''}
+                    onChange={(e) => cart.updateItemDiscount(item.key, parseFloat(e.target.value) || 0)}
+                    className="w-20 text-right text-xs border border-slate-200 rounded px-1 py-0.5"
+                  />
+                </div>
+              </div>
+            ))
+          )}
+        </div>
+
+        <div className="p-3 border-t border-slate-200 space-y-2">
+          <div className="flex items-center justify-between text-sm">
+            <span className="text-slate-500">Sous-total</span>
+            <span className="font-medium">{formatCurrency(cart.getSubtotal(), currency, decimals)}</span>
+          </div>
+          <div className="flex items-center justify-between text-sm">
+            <span className="text-slate-500">Remise globale</span>
+            <input
+              type="number"
+              value={cart.globalDiscount || ''}
+              onChange={(e) => cart.setGlobalDiscount(parseFloat(e.target.value) || 0)}
+              placeholder="0"
+              className="w-24 text-right text-sm border border-slate-200 rounded px-2 py-1"
+            />
+          </div>
+          {store.tax_enabled && store.tax_rate > 0 && (
+            <div className="flex items-center justify-between text-sm">
+              <span className="text-slate-500">TVA ({store.tax_rate}%)</span>
+              <span className="font-medium">
+                {formatCurrency(cart.getTotal() * store.tax_rate / 100, currency, decimals)}
+              </span>
+            </div>
+          )}
+          <div className="flex items-center justify-between text-lg font-bold pt-2 border-t border-slate-100">
+            <span className="text-slate-800">Total</span>
+            <span className="text-primary-700">
+              {formatCurrency(
+                store.tax_enabled ? cart.getTotal() * (1 + store.tax_rate / 100) : cart.getTotal(),
+                currency,
+                decimals
+              )}
+            </span>
+          </div>
+          <button
+            onClick={handleCheckout}
+            disabled={cart.items.length === 0}
+            className="btn-primary w-full text-base py-3"
+          >
+            <Check className="w-5 h-5" />
+            Encaisser
+          </button>
+        </div>
+      </div>
+
+      {showPayment && (
+        <PaymentModal
+          onClose={() => setShowPayment(false)}
+          onComplete={async (payments) => {
+            setLoading(true);
+            setError('');
+            try {
+              const taxAmount = store.tax_enabled
+                ? cart.getTotal() * store.tax_rate / 100
+                : 0;
+              const sale = await completeSale(
+                {
+                  items: cart.items.map((i) => ({
+                    variant_id: i.variant.id,
+                    imei_unit_id: i.imeiUnitId,
+                    product_name: `${i.product.brand} ${i.product.model}`,
+                    quantity: i.quantity,
+                    unit_price: i.unitPrice,
+                    unit_cost: i.variant.purchase_price,
+                    discount: i.discount,
+                  })),
+                  payments,
+                  subtotal: cart.getSubtotal(),
+                  discount: cart.globalDiscount,
+                  tax_amount: taxAmount,
+                  total: cart.getTotal() + taxAmount,
+                  customer_id: cart.customerId,
+                  customer_name: cart.customerName,
+                },
+                user,
+                store,
+                cashSession!.id
+              );
+              cart.clear();
+              setShowPayment(false);
+              setShowTicket(sale.id);
+            } catch (e) {
+              setError(e instanceof Error ? e.message : 'Erreur lors de la vente');
+            } finally {
+              setLoading(false);
+            }
+          }}
+          total={store.tax_enabled ? cart.getTotal() * (1 + store.tax_rate / 100) : cart.getTotal()}
+          currency={currency}
+          decimals={decimals}
+          loading={loading}
+        />
+      )}
+
+      {showTicket && (
+        <TicketModal saleId={showTicket} onClose={() => setShowTicket(null)} />
+      )}
+
+      {showCustomerPicker && (
+        <CustomerPickerModal
+          onSelect={(c) => {
+            cart.setCustomer(c?.id ?? null, c?.name ?? '');
+            setShowCustomerPicker(false);
+          }}
+          onClose={() => setShowCustomerPicker(false)}
+        />
+      )}
+    </div>
+  );
+}
+
+function PaymentModal({
+  onClose,
+  onComplete,
+  total,
+  currency,
+  decimals,
+  loading,
+}: {
+  onClose: () => void;
+  onComplete: (payments: Array<{ payment_method: SalePayment['payment_method']; amount: number; reference: string | null }>) => void;
+  total: number;
+  currency: string;
+  decimals: number;
+  loading: boolean;
+}) {
+  const [methods, setMethods] = useState<Array<{ payment_method: string; amount: string; reference: string }>>([
+    { payment_method: 'cash', amount: total.toFixed(decimals), reference: '' },
+  ]);
+
+  const paidTotal = methods.reduce((sum, m) => sum + (parseFloat(m.amount) || 0), 0);
+  const remaining = total - paidTotal;
+
+  const addMethod = () => {
+    if (methods.length >= 4) return;
+    setMethods([...methods, { payment_method: 'cash', amount: remaining.toFixed(decimals), reference: '' }]);
+  };
+
+  const updateMethod = (idx: number, field: 'payment_method' | 'amount' | 'reference', value: string) => {
+    setMethods(methods.map((m, i) => (i === idx ? { ...m, [field]: value } : m)));
+  };
+
+  const removeMethod = (idx: number) => {
+    setMethods(methods.filter((_, i) => i !== idx));
+  };
+
+  const handleConfirm = () => {
+    const payments = methods
+      .filter((m) => parseFloat(m.amount) > 0)
+      .map((m) => ({
+        payment_method: m.payment_method as SalePayment['payment_method'],
+        amount: parseFloat(m.amount),
+        reference: m.reference || null,
+      }));
+    if (payments.length === 0) return;
+    onComplete(payments);
+  };
+
+  return (
+    <div className="fixed inset-0 bg-black/40 z-50 flex items-center justify-center p-4 animate-fade-in" onClick={onClose}>
+      <div className="bg-white rounded-2xl shadow-2xl w-full max-w-md animate-scale-in" onClick={(e) => e.stopPropagation()}>
+        <div className="p-4 border-b border-slate-200 flex items-center justify-between">
+          <h2 className="text-lg font-semibold text-slate-800">Encaissement</h2>
+          <button onClick={onClose} className="text-slate-400 hover:text-slate-600">
+            <X className="w-5 h-5" />
+          </button>
+        </div>
+
+        <div className="p-4 space-y-4">
+          <div className="bg-primary-50 rounded-lg p-3 text-center">
+            <p className="text-sm text-primary-600">Total à payer</p>
+            <p className="text-2xl font-bold text-primary-700">{formatCurrency(total, currency, decimals)}</p>
+          </div>
+
+          {methods.map((m, idx) => (
+            <div key={idx} className="border border-slate-200 rounded-lg p-3 space-y-2">
+              <div className="flex items-center justify-between">
+                <span className="text-sm font-medium text-slate-700">Paiement {idx + 1}</span>
+                {methods.length > 1 && (
+                  <button onClick={() => removeMethod(idx)} className="text-slate-300 hover:text-error-600">
+                    <X className="w-4 h-4" />
+                  </button>
+                )}
+              </div>
+              <select
+                value={m.payment_method}
+                onChange={(e) => updateMethod(idx, 'payment_method', e.target.value)}
+                className="input"
+              >
+                {PAYMENT_METHODS.map((pm) => (
+                  <option key={pm.value} value={pm.value}>{pm.label}</option>
+                ))}
+              </select>
+              <div className="flex gap-2">
+                <input
+                  type="number"
+                  value={m.amount}
+                  onChange={(e) => updateMethod(idx, 'amount', e.target.value)}
+                  placeholder="Montant"
+                  className="input flex-1"
+                />
+                {(m.payment_method === 'orange_money' || m.payment_method === 'mtn_momo' || m.payment_method === 'wave' || m.payment_method === 'transfer') && (
+                  <input
+                    type="text"
+                    value={m.reference}
+                    onChange={(e) => updateMethod(idx, 'reference', e.target.value)}
+                    placeholder="ID transaction"
+                    className="input flex-1"
+                  />
+                )}
+              </div>
+            </div>
+          ))}
+
+          {remaining > 0 && methods.length < 4 && (
+            <button onClick={addMethod} className="btn-secondary w-full">
+              <Plus className="w-4 h-4" /> Ajouter un mode de paiement
+            </button>
+          )}
+
+          <div className="flex items-center justify-between pt-2 border-t border-slate-100">
+            <div>
+              <p className="text-sm text-slate-500">
+                {remaining > 0
+                  ? `Reste: ${formatCurrency(remaining, currency, decimals)}`
+                  : remaining < 0
+                  ? `Monnaie: ${formatCurrency(-remaining, currency, decimals)}`
+                  : 'Tout payé'}
+              </p>
+            </div>
+            <button
+              onClick={handleConfirm}
+              disabled={loading || remaining > 0.01}
+              className="btn-primary"
+            >
+              {loading ? 'Traitement...' : 'Valider la vente'}
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function CustomerPickerModal({
+  onSelect,
+  onClose,
+}: {
+  onSelect: (customer: Customer | null) => void;
+  onClose: () => void;
+}) {
+  const [search, setSearch] = useState('');
+  const [results, setResults] = useState<Customer[]>([]);
+
+  useEffect(() => {
+    if (!search.trim()) {
+      setResults([]);
+      return;
+    }
+    const timer = setTimeout(async () => {
+      const pattern = `%${search.toLowerCase()}%`;
+      setResults(await query<Customer>(
+        'SELECT * FROM customers WHERE LOWER(name) LIKE $1 OR phone LIKE $1 LIMIT 20',
+        [pattern]
+      ));
+    }, 200);
+    return () => clearTimeout(timer);
+  }, [search]);
+
+  return (
+    <div className="fixed inset-0 bg-black/40 z-50 flex items-center justify-center p-4 animate-fade-in" onClick={onClose}>
+      <div className="bg-white rounded-2xl shadow-2xl w-full max-w-md animate-scale-in" onClick={(e) => e.stopPropagation()}>
+        <div className="p-4 border-b border-slate-200 flex items-center justify-between">
+          <h2 className="text-lg font-semibold text-slate-800">Sélectionner un client</h2>
+          <button onClick={onClose} className="text-slate-400 hover:text-slate-600">
+            <X className="w-5 h-5" />
+          </button>
+        </div>
+        <div className="p-4">
+          <input
+            type="text"
+            value={search}
+            onChange={(e) => setSearch(e.target.value)}
+            placeholder="Nom ou téléphone..."
+            className="input mb-3"
+            autoFocus
+          />
+          <button
+            onClick={() => onSelect(null)}
+            className="w-full text-left px-3 py-2.5 rounded-lg hover:bg-slate-50 text-sm text-slate-600 mb-2"
+          >
+            <User className="w-4 h-4 inline mr-2" />
+            Client de passage (sans compte)
+          </button>
+          {results.map((c) => (
+            <button
+              key={c.id}
+              onClick={() => onSelect(c)}
+              className="w-full text-left px-3 py-2.5 rounded-lg hover:bg-primary-50 text-sm"
+            >
+              <p className="font-medium text-slate-800">{c.name}</p>
+              <p className="text-xs text-slate-400">{c.phone}</p>
+            </button>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
