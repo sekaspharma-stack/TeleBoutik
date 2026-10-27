@@ -10,7 +10,7 @@ import {
   type WriteBatch,
 } from 'firebase/firestore';
 import { query, execute } from './localDb';
-import type { SyncOp, Sale, SaleLine, SalePayment, StockMovement, ImeiUnit, CashMovement, JournalEntry, AuditLog } from '../types';
+import type { SyncOp, Sale, SaleLine, SalePayment, StockMovement, CashMovement, JournalEntry, AuditLog } from '../types';
 
 type SyncResult = {
   synced: number;
@@ -194,26 +194,6 @@ async function syncEntity(entity: string, operation: string, recordId: string, r
           updated_at: v.updated_at,
           synced_at: serverTimestamp(),
         });
-
-        // Keep initial stock and serialized-device records in Firestore with their product.
-        const imeis = await query<ImeiUnit>(
-          'SELECT * FROM imei_units WHERE variant_id = $1', [v.id]
-        );
-        for (const imei of imeis) {
-          await setDoc(doc(db, 'imei_units', String(imei.id)), {
-            ...imei,
-            synced_at: serverTimestamp(),
-          });
-        }
-        const movements = await query<StockMovement>(
-          'SELECT * FROM stock_movements WHERE variant_id = $1', [v.id]
-        );
-        for (const movement of movements) {
-          await setDoc(doc(db, 'stock_movements', String(movement.id)), {
-            ...movement,
-            synced_at: serverTimestamp(),
-          });
-        }
       }
       break;
     }

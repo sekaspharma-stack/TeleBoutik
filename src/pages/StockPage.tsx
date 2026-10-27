@@ -1,8 +1,7 @@
 import { useState, useEffect, useCallback } from 'react';
 import { Search, Package, Smartphone, Plus, X, Edit2, Tag, AlertTriangle } from 'lucide-react';
 import { query, queryOne, execute, generateId, now } from '../db/localDb';
-import { addAuditLog, addSyncOp } from '../db/audit';
-import { useSync } from '../context/SyncContext';
+import { addAuditLog } from '../db/audit';
 import { useAuth } from '../context/AuthContext';
 import { formatCurrency, lifecycleLabel, canSeeMargin, generateBarcode, generateSku } from '../lib/utils';
 import type { Product, ProductVariant, ImeiUnit } from '../types';
@@ -263,20 +262,18 @@ function AddProductModal({ onClose, onSaved }: { onClose: () => void; onSaved: (
     const variantId = generateId();
     const sku = generateSku(brand, model, Object.values(attrs).join('-'));
     const barcode = generateBarcode();
-    const productCreatedAt = now();
-    const variantCreatedAt = productCreatedAt;
 
     await execute(
       `INSERT INTO products (id, brand, family, model, category, is_serialized, created_at, updated_at)
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
-      [productId, brand, category, model, category, isSerialized, productCreatedAt, productCreatedAt]
+      [productId, brand, category, model, category, isSerialized, now(), now()]
     );
 
     await execute(
       `INSERT INTO product_variants (id, product_id, sku, barcode, attributes, purchase_price, sale_price, wholesale_price, min_stock, max_stock, created_at, updated_at)
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 5, 100, $9, $10)`,
       [variantId, productId, sku, barcode, JSON.stringify(attrs),
-       parseFloat(purchasePrice) || 0, parseFloat(salePrice) || 0, 0, variantCreatedAt, variantCreatedAt]
+       parseFloat(purchasePrice) || 0, parseFloat(salePrice) || 0, 0, now(), now()]
     );
 
     if (isSerialized && imei) {
@@ -300,35 +297,6 @@ function AddProductModal({ onClose, onSaved }: { onClose: () => void; onSaved: (
     }
 
     await addAuditLog(user, 'product', 'create', null, { brand, model, sku });
-    await addSyncOp('products', 'insert', productId, {
-      id: productId,
-      store_id: store.id,
-      brand,
-      family: category,
-      model,
-      category,
-      image_url: null,
-      is_serialized: isSerialized,
-      created_at: productCreatedAt,
-      updated_at: variantCreatedAt,
-      variant: {
-        id: variantId,
-        product_id: productId,
-        sku,
-        barcode,
-        attributes: attrs,
-        purchase_price: parseFloat(purchasePrice) || 0,
-        sale_price: parseFloat(salePrice) || 0,
-        wholesale_price: 0,
-        min_stock: 5,
-        max_stock: 100,
-        created_at: variantCreatedAt,
-        updated_at: variantCreatedAt,
-      },
-    });
-    // Try cloud sync immediately; if offline, the queued operation remains available for the next sync.
-    await useSync.getState().refreshPendingCount();
-    if (navigator.onLine) await useSync.getState().triggerSync();
     onSaved();
   };
 

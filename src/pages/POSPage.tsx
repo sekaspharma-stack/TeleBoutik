@@ -17,26 +17,6 @@ interface SearchResult {
   imei_available: number;
 }
 
-interface SearchRow {
-  p_id: string; p_brand: string; p_family: string; p_model: string; p_category: string;
-  p_image_url: string | null; p_is_serialized: boolean; p_created_at: string; p_updated_at: string;
-  v_id: string; v_product_id: string; v_sku: string; v_barcode: string; v_attributes: string | Record<string, string>;
-  v_purchase_price: number; v_sale_price: number; v_wholesale_price: number;
-  v_min_stock: number; v_max_stock: number; v_created_at: string; v_updated_at: string;
-  stock_qty: number | string; imei_available: number | string;
-}
-
-function safeParseAttributes(value: string): Record<string, string> {
-  try {
-    const parsed: unknown = JSON.parse(value);
-    return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
-      ? parsed as Record<string, string>
-      : {};
-  } catch {
-    return {};
-  }
-}
-
 const PAYMENT_METHODS = [
   { value: 'cash', label: 'Espèces' },
   { value: 'orange_money', label: 'Orange Money' },
@@ -69,18 +49,15 @@ export default function POSPage() {
       return;
     }
     const pattern = `%${q.toLowerCase()}%`;
-    const rows = await query<SearchRow>(
-      `SELECT p.id AS p_id, p.brand AS p_brand, p.family AS p_family, p.model AS p_model,
-              p.category AS p_category, p.image_url AS p_image_url, p.is_serialized AS p_is_serialized,
-              p.created_at AS p_created_at, p.updated_at AS p_updated_at,
-              pv.id AS v_id, pv.product_id AS v_product_id, pv.sku AS v_sku, pv.barcode AS v_barcode,
-              pv.attributes AS v_attributes, pv.purchase_price AS v_purchase_price,
-              pv.sale_price AS v_sale_price, pv.wholesale_price AS v_wholesale_price,
-              pv.min_stock AS v_min_stock, pv.max_stock AS v_max_stock,
-              pv.created_at AS v_created_at, pv.updated_at AS v_updated_at,
-              COALESCE((SELECT SUM(CASE WHEN sm.direction = 'in' THEN sm.quantity ELSE -sm.quantity END)
-                        FROM stock_movements sm WHERE sm.variant_id = pv.id), 0) AS stock_qty,
-              (SELECT COUNT(*) FROM imei_units iu WHERE iu.variant_id = pv.id AND iu.lifecycle_status = 'in_stock') AS imei_available
+    const rows = await query<SearchResult>(
+      `SELECT p.*, pv.*,
+         p.id as product_id,
+         pv.id as variant_id,
+         COALESCE(
+           (SELECT SUM(CASE WHEN direction='in' THEN quantity ELSE -quantity END) FROM stock_movements WHERE variant_id = pv.id AND movement_type != 'sale' OR movement_type = 'sale'),
+           0
+         ) as stock_qty,
+         (SELECT COUNT(*) FROM imei_units WHERE variant_id = pv.id AND lifecycle_status = 'in_stock') as imei_available
        FROM products p
        JOIN product_variants pv ON pv.product_id = p.id
        WHERE LOWER(p.brand) LIKE $1 OR LOWER(p.model) LIKE $1 OR LOWER(pv.sku) LIKE $1 OR LOWER(pv.barcode) LIKE $1
@@ -88,22 +65,7 @@ export default function POSPage() {
        LIMIT 30`,
       [pattern]
     );
-    setResults(rows.map((row) => ({
-      product: {
-        id: row.p_id, brand: row.p_brand, family: row.p_family, model: row.p_model,
-        category: row.p_category, image_url: row.p_image_url, is_serialized: row.p_is_serialized,
-        created_at: row.p_created_at, updated_at: row.p_updated_at,
-      },
-      variant: {
-        id: row.v_id, product_id: row.v_product_id, sku: row.v_sku, barcode: row.v_barcode,
-        attributes: typeof row.v_attributes === 'string' ? safeParseAttributes(row.v_attributes) : row.v_attributes,
-        purchase_price: Number(row.v_purchase_price) || 0, sale_price: Number(row.v_sale_price) || 0,
-        wholesale_price: Number(row.v_wholesale_price) || 0, min_stock: Number(row.v_min_stock) || 0,
-        max_stock: Number(row.v_max_stock) || 0, created_at: row.v_created_at, updated_at: row.v_updated_at,
-      },
-      stock_qty: Number(row.stock_qty) || 0,
-      imei_available: Number(row.imei_available) || 0,
-    })));
+    setResults(rows);
   }, []);
 
   useEffect(() => {
