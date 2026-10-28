@@ -1,0 +1,22 @@
+node_modules/
+.env
+.env.*
+!.env.example
+vite.config.js.timestamp-*.mjs
+vite.config.mjs.timestamp-*.mjs
+vite.config.cjs.timestamp-*.mjs
+vite.config.ts.timestamp-*.mjs
+vite.config.mts.timestamp-*.mjs
+vite.config.cts.timestamp-*.mjs
+vitest.config.js.timestamp-*.mjs
+vitest.config.mjs.timestamp-*.mjs
+vitest.config.cjs.timestamp-*.mjs
+vitest.config.ts.timestamp-*.mjs
+vitest.config.mts.timestamp-*.mjs
+vitest.config.cts.timestamp-*.mjs
+
+# Build output / generated TypeScript build metadata
+dist/
+*.tsbuildinfo
+vite.config.js
+vite.config.d.ts
