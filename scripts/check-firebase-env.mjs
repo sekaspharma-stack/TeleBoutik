@@ -1,3 +1,4 @@
+
 const required = [
   'VITE_FIREBASE_API_KEY',
   'VITE_FIREBASE_AUTH_DOMAIN',
@@ -5,13 +6,18 @@ const required = [
   'VITE_FIREBASE_APP_ID',
 ];
 
+console.log('[Diagnostic] Vérification des variables Firebase :');
+
+for (const name of required) {
+  const value = process.env[name];
+  console.log(`${name}: ${value?.trim() ? 'PRESENTE' : 'ABSENTE'}`);
+}
+
 const missing = required.filter((name) => !process.env[name]?.trim());
+
 if (missing.length) {
-  console.error('\n[TeleBoutik] Build Cloudflare interrompu : variables Firebase obligatoires absentes au moment du build.');
-  console.error('Ajoutez-les dans Cloudflare Pages > Settings > Variables and Secrets (environnement Production), puis relancez un nouveau build.');
-  console.error('Variables manquantes : ' + missing.join(', '));
-  console.error('Aucune valeur de variable n’est affichée.\n');
+  console.error('[Diagnostic] Variables absentes :', missing.join(', '));
   process.exit(1);
 }
 
-console.log('[TeleBoutik] Variables Firebase obligatoires présentes pour le build Cloudflare.');
+console.log('[Diagnostic] Toutes les variables obligatoires sont présentes.');
