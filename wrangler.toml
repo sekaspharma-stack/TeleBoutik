@@ -1,4 +1,0 @@
-# Cloudflare Pages project configuration
-name = "teleboutik"
-pages_build_output_dir = "./dist"
-compatibility_date = "2026-10-28"
