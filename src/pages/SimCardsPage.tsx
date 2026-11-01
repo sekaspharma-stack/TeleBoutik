@@ -4,6 +4,7 @@ import { execute, query, queryOne, generateId, now } from '../db/localDb';
 import { addAuditLog } from '../db/audit';
 import { scheduleLocalTableSync } from '../db/syncEngine';
 import { useAuth } from '../context/AuthContext';
+import { useLiveRefresh } from '../context/SyncContext';
 import { formatCurrency, formatDateTime } from '../lib/utils';
 import type { CashSession, SimCard } from '../types';
 
@@ -13,7 +14,7 @@ export default function SimCardsPage(){
  const {user,store}=useAuth(); const [rows,setRows]=useState<SimCard[]>([]); const [session,setSession]=useState<CashSession|null>(null); const [batchRows,setBatchRows]=useState<Array<{id:string;operator:string;quantity_cards:number;purchase_cost_per_card:number;sale_price_per_card:number;currency_code:Currency}>>([]); const [batchQty,setBatchQty]=useState('250'); const [batchCost,setBatchCost]=useState(''); const [batchPrice,setBatchPrice]=useState('');
  const [operator,setOperator]=useState<Operator>('airtel'); const [phone,setPhone]=useState(''); const [serial,setSerial]=useState(''); const [cost,setCost]=useState(''); const [price,setPrice]=useState(''); const [currency,setCurrency]=useState<Currency>('CDF'); const [supplier,setSupplier]=useState(''); const [customer,setCustomer]=useState(''); const [reference,setReference]=useState(''); const [search,setSearch]=useState(''); const [error,setError]=useState(''); const [success,setSuccess]=useState(''); const [busy,setBusy]=useState(false); const busyLock=useRef(false);
  const guard=<A extends unknown[]>(fn:(...a:A)=>Promise<void>)=>async(...a:A)=>{if(busyLock.current)return;busyLock.current=true;setBusy(true);try{await fn(...a)}finally{busyLock.current=false;setBusy(false)}};
- const load=useCallback(async()=>{if(!user||!store)return;setRows(await query<SimCard>('SELECT * FROM sim_cards WHERE store_id=$1 ORDER BY created_at DESC LIMIT 300',[store.id]));setSession(await queryOne<CashSession>("SELECT * FROM cash_sessions WHERE user_id=$1 AND status='open' ORDER BY opened_at DESC LIMIT 1",[user.id]));setBatchRows(await query<{id:string;operator:string;quantity_cards:number;purchase_cost_per_card:number;sale_price_per_card:number;currency_code:Currency}>('SELECT * FROM sim_stock_batches WHERE store_id=$1 ORDER BY created_at DESC',[store.id]));},[user,store]); useEffect(()=>{void load()},[load]);
+ const load=useCallback(async()=>{if(!user||!store)return;setRows(await query<SimCard>('SELECT * FROM sim_cards WHERE store_id=$1 ORDER BY created_at DESC LIMIT 300',[store.id]));setSession(await queryOne<CashSession>("SELECT * FROM cash_sessions WHERE user_id=$1 AND status='open' ORDER BY opened_at DESC LIMIT 1",[user.id]));setBatchRows(await query<{id:string;operator:string;quantity_cards:number;purchase_cost_per_card:number;sale_price_per_card:number;currency_code:Currency}>('SELECT * FROM sim_stock_batches WHERE store_id=$1 ORDER BY created_at DESC',[store.id]));},[user,store]); useEffect(()=>{void load()},[load]);useLiveRefresh(load);
  if(!user||!store)return null;
  if(!['owner','manager','seller'].includes(user.role))return <div className="card p-6">Accès réservé au propriétaire, au gérant et aux agents de vente.</div>;
  const visible=rows.filter(r=>!search||[r.phone_number,r.serial_number,r.operator,r.status,r.sold_to,r.sale_reference].some(v=>String(v||'').toLowerCase().includes(search.toLowerCase())));

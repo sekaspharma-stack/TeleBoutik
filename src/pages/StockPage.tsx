@@ -4,6 +4,7 @@ import { Search, Package, Smartphone, Plus, X, Edit2, Tag, AlertTriangle, Archiv
 import { query, queryOne, execute, generateId, now, withLocalTransaction } from '../db/localDb';
 import { addAuditLog } from '../db/audit';
 import { useAuth } from '../context/AuthContext';
+import { useLiveRefresh } from '../context/SyncContext';
 import { formatCurrency, lifecycleLabel, canSeeMargin, generateBarcode, generateSku } from '../lib/utils';
 import type { Product, ProductVariant, ImeiUnit } from '../types';
 import LoadingButton from '../components/LoadingButton';
@@ -90,6 +91,7 @@ export default function StockPage() {
   }, []);
 
   useEffect(() => { loadStock(); }, [loadStock]);
+  useLiveRefresh(loadStock);
   useEffect(() => {
     const state = location.state as { scannedBarcode?: string; openCreateProduct?: boolean } | null;
     if (state?.openCreateProduct && state.scannedBarcode) { setInitialBarcode(state.scannedBarcode); setShowAdd(true); window.history.replaceState({}, document.title); }

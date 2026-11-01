@@ -4,6 +4,7 @@ import { getDb, query, queryOne, generateId, now } from '../db/localDb';
 import { addAuditLog } from '../db/audit';
 import { scheduleLocalTableSync } from '../db/syncEngine';
 import { useAuth } from '../context/AuthContext';
+import { useLiveRefresh } from '../context/SyncContext';
 import { formatCurrency, formatDateTime } from '../lib/utils';
 import type { AirtelTransaction, CashSession } from '../types';
 import CustomerSelect, { type SelectedCustomer } from '../components/CustomerSelect';
@@ -52,6 +53,7 @@ export default function AirtelMoneyPage() {
   }, [user, store, store?.id, store?.currency]);
 
   useEffect(() => { void load(); }, [load]);
+  useLiveRefresh(load);
 
   const visibleTransactions = useMemo(() => {
     const needle = search.trim().toLowerCase();

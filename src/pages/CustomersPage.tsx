@@ -3,6 +3,7 @@ import { Users, Search, Plus, X, Phone, Wallet } from 'lucide-react';
 import { query, execute, generateId, now } from '../db/localDb';
 import { addAuditLog } from '../db/audit';
 import { useAuth } from '../context/AuthContext';
+import { useLiveRefresh } from '../context/SyncContext';
 import { formatCurrency } from '../lib/utils';
 import type { Customer } from '../types';
 import LoadingButton from '../components/LoadingButton';
@@ -18,6 +19,7 @@ export default function CustomersPage() {
   }, []);
 
   useEffect(() => { load(); }, [load]);
+  useLiveRefresh(load);
 
   if (!user || !store) return null;
   const currency = store.currency;

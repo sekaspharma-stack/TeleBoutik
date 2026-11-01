@@ -1,17 +1,24 @@
-import { useState, useEffect, useCallback } from 'react';
-import { Wallet, Lock, Unlock, Plus, ArrowDownCircle, ArrowUpCircle, X, AlertTriangle, Coins, Smartphone, Landmark, Sunrise } from 'lucide-react';
+import { useState, useEffect, useCallback, useRef } from 'react';
+import { Wallet, Lock, Unlock, Plus, ArrowDownCircle, ArrowUpCircle, X, AlertTriangle, Coins, Smartphone, Landmark, Sunrise, Users } from 'lucide-react';
 import { query, queryOne, execute, generateId, now } from '../db/localDb';
 import { addAuditLog } from '../db/audit';
 import { scheduleLocalTableSync } from '../db/syncEngine';
 import { useAuth } from '../context/AuthContext';
+import { useLiveRefresh } from '../context/SyncContext';
 import { formatCurrency, formatDateTime, paymentLabel } from '../lib/utils';
 import type { CashSession, CashMovement } from '../types';
 import LoadingButton from '../components/LoadingButton';
 import { MoneyCard, SoftMoneyCard } from '../components/MoneyCard';
 
+type OpenSessionRow = CashSession & { agent_name: string | null; cabin_name: string | null };
+type HistorySessionRow = CashSession & { agent_name: string | null };
+
 export default function CashPage() {
   const { user, store, cashSession, setCashSession } = useAuth();
-  const [sessions, setSessions] = useState<CashSession[]>([]);
+  const [sessions, setSessions] = useState<HistorySessionRow[]>([]);
+  const [openSessions, setOpenSessions] = useState<OpenSessionRow[]>([]);
+  const [viewSession, setViewSession] = useState<OpenSessionRow | null>(null);
+  const selectedRef = useRef<string | null>(null);
   const [movements, setMovements] = useState<CashMovement[]>([]);
   const [showOpen, setShowOpen] = useState(false);
   const [showMovement, setShowMovement] = useState(false);
@@ -20,30 +27,65 @@ export default function CashPage() {
   const [exchangeRate, setExchangeRate] = useState(0);
   const [exchanges, setExchanges] = useState<Array<{ id: string; usd_amount: number; cdf_amount: number; applied_rate: number; created_at: string; user_id: string }>>([]);
 
+  // Le propriétaire et le gérant supervisent TOUTES les caisses ouvertes de la boutique ;
+  // un vendeur ne voit que sa propre session.
+  const canSupervise = user ? ['owner', 'manager'].includes(user.role) : false;
+
   const load = useCallback(async () => {
-    if (!user) return;
-    const openSession = await queryOne<CashSession>(
+    if (!user || !store) return;
+    const ownSession = await queryOne<CashSession>(
       `SELECT * FROM cash_sessions WHERE user_id = $1 AND status = 'open' ORDER BY opened_at DESC LIMIT 1`,
       [user.id]
     );
-    setCashSession(openSession ?? null);
+    setCashSession(ownSession ?? null);
 
-    setSessions(await query<CashSession>(
-      `SELECT * FROM cash_sessions ORDER BY opened_at DESC LIMIT 20`
+    // Avant : la requête filtrait toujours sur l'utilisateur connecté, donc le propriétaire ne voyait jamais
+    // la caisse ouverte par une vendeuse sur un autre appareil, même une fois la donnée synchronisée.
+    const visibleOpen = canSupervise
+      ? await query<OpenSessionRow>(
+          `SELECT cs.*, u.name AS agent_name, c.name AS cabin_name
+           FROM cash_sessions cs
+           LEFT JOIN users u ON u.id = cs.user_id
+           LEFT JOIN cabins c ON c.store_id = cs.store_id AND c.register_number = cs.register_number
+           WHERE cs.status = 'open' AND cs.store_id = $1
+           ORDER BY cs.opened_at DESC`,
+          [store.id]
+        )
+      : ownSession ? [{ ...ownSession, agent_name: user.name, cabin_name: null }] : [];
+    setOpenSessions(visibleOpen);
+
+    const chosen = visibleOpen.find((row) => row.id === selectedRef.current)
+      ?? visibleOpen.find((row) => row.user_id === user.id)
+      ?? visibleOpen[0]
+      ?? null;
+    selectedRef.current = chosen?.id ?? null;
+    setViewSession(chosen);
+
+    setSessions(await query<HistorySessionRow>(
+      canSupervise
+        ? `SELECT cs.*, u.name AS agent_name FROM cash_sessions cs LEFT JOIN users u ON u.id = cs.user_id WHERE cs.store_id = $1 ORDER BY cs.opened_at DESC LIMIT 20`
+        : `SELECT cs.*, u.name AS agent_name FROM cash_sessions cs LEFT JOIN users u ON u.id = cs.user_id WHERE cs.user_id = $1 ORDER BY cs.opened_at DESC LIMIT 20`,
+      [canSupervise ? store.id : user.id]
     ));
     setExchanges(await query<{ id: string; usd_amount: number; cdf_amount: number; applied_rate: number; created_at: string; user_id: string }>(`SELECT * FROM currency_exchanges ORDER BY created_at DESC LIMIT 30`));
     const rateRows = await query<{ value: string }>("SELECT value FROM settings WHERE key = 'usd_cdf_exchange_rate'");
     setExchangeRate(Number(rateRows[0]?.value ?? 0));
 
-    if (openSession) {
+    if (chosen) {
       setMovements(await query<CashMovement>(
         `SELECT * FROM cash_movements WHERE cash_session_id = $1 ORDER BY created_at DESC`,
-        [openSession.id]
+        [chosen.id]
       ));
+    } else {
+      setMovements([]);
     }
-  }, [user, setCashSession]);
+  }, [user, store, canSupervise, setCashSession]);
 
   useEffect(() => { load(); }, [load]);
+  // Une caisse ouverte, un encaissement ou une clôture sur un autre appareil met cet écran à jour aussitôt.
+  useLiveRefresh(load);
+
+  const selectSession = (id: string) => { selectedRef.current = id; void load(); };
 
   if (!user || !store) return null;
   const currency = store.currency;
@@ -124,14 +166,14 @@ export default function CashPage() {
   };
 
   const addMovement = async (type: 'deposit' | 'withdrawal', method: string, amount: number, reason: string, currencyCode: string) => {
-    if (!user || !cashSession) return;
+    if (!user || !viewSession) return;
     const direction = type === 'deposit' ? 'in' : 'out';
     const movementId = generateId();
     const converted = convertToStoreCurrency(amount, currencyCode);
     await execute(
       `INSERT INTO cash_movements (id, cash_session_id, movement_type, payment_method, amount, direction, reference_type, user_id, reason, created_at, currency_code, original_amount, applied_rate)
        VALUES ($1, $2, $3, $4, $5, $6, 'manual', $7, $8, $9, $10, $11, $12)`,
-      [movementId, cashSession.id, type, method, converted.amount, direction, user.id, reason, now(), currencyCode, amount, converted.rate]
+      [movementId, viewSession.id, type, method, converted.amount, direction, user.id, reason, now(), currencyCode, amount, converted.rate]
     );
     await execute("INSERT INTO app_meta (key,value) VALUES ($1,'upsert') ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value", [`cloud_pending:cash_movements:${movementId}`]);
     scheduleLocalTableSync('cash_movements', movementId);
@@ -141,16 +183,17 @@ export default function CashPage() {
   };
 
   const closeSession = async (countedAmount: number, notes: string) => {
-    if (!user || !cashSession) return;
+    if (!user || !viewSession) return;
     const diff = countedAmount - expectedBalance;
     await execute(
       `UPDATE cash_sessions SET status = 'closed', closing_amount = $1, expected_closing = $2, difference = $3, closed_at = $4, notes = $5 WHERE id = $6`,
-      [countedAmount, expectedBalance, diff, now(), notes, cashSession.id]
+      [countedAmount, expectedBalance, diff, now(), notes, viewSession.id]
     );
-    await execute("INSERT INTO app_meta (key,value) VALUES ($1,'upsert') ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value", [`cloud_pending:cash_sessions:${cashSession.id}`]);
-    scheduleLocalTableSync('cash_sessions', cashSession.id);
-    await addAuditLog(user, 'cash_session', 'close', cashSession, { closing_amount: countedAmount, expected: expectedBalance, difference: diff });
-    setCashSession(null);
+    await execute("INSERT INTO app_meta (key,value) VALUES ($1,'upsert') ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value", [`cloud_pending:cash_sessions:${viewSession.id}`]);
+    scheduleLocalTableSync('cash_sessions', viewSession.id);
+    await addAuditLog(user, 'cash_session', 'close', viewSession, { closing_amount: countedAmount, expected: expectedBalance, difference: diff });
+    if (viewSession.id === cashSession?.id) setCashSession(null);
+    selectedRef.current = null;
     setShowClose(false);
     load();
   };
@@ -162,7 +205,25 @@ export default function CashPage() {
         <p className="text-sm text-slate-500">Gestion des sessions et mouvements de caisse</p>
       </div>
 
-      {cashSession ? (
+      {canSupervise && openSessions.length > 0 && (
+        <div className="mb-3 flex flex-wrap items-center gap-2" role="tablist" aria-label="Caisses ouvertes">
+          <span className="flex items-center gap-1 text-xs font-medium text-slate-500"><Users className="w-3.5 h-3.5" /> Caisses ouvertes ({openSessions.length})</span>
+          {openSessions.map((row) => (
+            <button
+              key={row.id}
+              role="tab"
+              aria-selected={row.id === viewSession?.id}
+              onClick={() => selectSession(row.id)}
+              className={`rounded-full border px-3 py-1 text-xs font-medium transition ${row.id === viewSession?.id ? 'border-primary-500 bg-primary-50 text-primary-700' : 'border-slate-200 bg-white text-slate-600 hover:bg-slate-50'}`}
+            >
+              {row.agent_name ?? 'Agent'}{row.user_id === user.id ? ' (moi)' : ''} · {row.cabin_name ?? `registre ${row.register_number}`}
+            </button>
+          ))}
+          {!cashSession && <button onClick={() => setShowOpen(true)} className="btn-secondary !py-1 !text-xs"><Unlock className="w-3.5 h-3.5" /> Ouvrir ma caisse</button>}
+        </div>
+      )}
+
+      {viewSession ? (
         <div className="space-y-4">
           <div className="card p-4">
             <div className="flex items-center justify-between mb-3">
@@ -171,8 +232,11 @@ export default function CashPage() {
                   <Unlock className="w-5 h-5 text-success-600" />
                 </div>
                 <div>
-                  <p className="font-semibold text-slate-800">Session ouverte</p>
-                  <p className="text-xs text-slate-400">Depuis {formatDateTime(cashSession.opened_at)}</p>
+                  <p className="font-semibold text-slate-800">
+                    {viewSession.user_id === user.id ? 'Session ouverte' : `Caisse de ${viewSession.agent_name ?? 'un agent'}`}
+                    <span className="ml-2 text-xs font-normal text-slate-500">{viewSession.cabin_name ?? `registre ${viewSession.register_number}`}</span>
+                  </p>
+                  <p className="text-xs text-slate-400">Depuis {formatDateTime(viewSession.opened_at)}</p>
                 </div>
               </div>
               <div className="flex gap-2">
@@ -250,7 +314,7 @@ export default function CashPage() {
       ) : (
         <div className="card p-8 text-center">
           <Wallet className="w-12 h-12 text-slate-300 mx-auto mb-3" />
-          <p className="text-slate-500 mb-4">Aucune session de caisse ouverte</p>
+          <p className="text-slate-500 mb-4">{canSupervise ? 'Aucune session de caisse ouverte dans la boutique' : 'Aucune session de caisse ouverte'}</p>
           <button onClick={() => setShowOpen(true)} className="btn-primary">
             <Unlock className="w-4 h-4" /> Ouvrir la caisse
           </button>
@@ -266,9 +330,10 @@ export default function CashPage() {
       <div className="mt-6">
         <h3 className="font-semibold text-slate-700 text-sm mb-2">Historique des sessions</h3>
         <div className="card overflow-x-auto">
-          <table className="w-full text-sm min-w-[600px]">
+          <table className="w-full text-sm min-w-[700px]">
             <thead className="bg-slate-50 border-b border-slate-200">
               <tr>
+                <th className="text-left px-4 py-2 font-medium text-slate-600">Agent</th>
                 <th className="text-left px-4 py-2 font-medium text-slate-600">Ouverture</th>
                 <th className="text-left px-4 py-2 font-medium text-slate-600">Clôture</th>
                 <th className="text-right px-4 py-2 font-medium text-slate-600">Fond</th>
@@ -281,6 +346,7 @@ export default function CashPage() {
             <tbody className="divide-y divide-slate-100">
               {sessions.map((s) => (
                 <tr key={s.id} className="hover:bg-slate-50">
+                  <td className="px-4 py-2 text-xs text-slate-600">{s.agent_name ?? '—'} <span className="text-slate-400">· reg. {s.register_number}</span></td>
                   <td className="px-4 py-2 text-xs text-slate-500">{formatDateTime(s.opened_at)}</td>
                   <td className="px-4 py-2 text-xs text-slate-500">{s.closed_at ? formatDateTime(s.closed_at) : '—'}</td>
                   <td className="px-4 py-2 text-right">{formatCurrency(s.opening_amount, currency, decimals)}</td>
@@ -311,7 +377,7 @@ export default function CashPage() {
       {showMovement && (
         <MovementModal onConfirm={addMovement} onClose={() => setShowMovement(false)} currency={currency} decimals={decimals} />
       )}
-      {showExchange && cashSession && <CurrencyExchangeModal cashSessionId={cashSession.id} onClose={() => setShowExchange(false)} onSaved={() => { setShowExchange(false); load(); }} />}
+      {showExchange && viewSession && <CurrencyExchangeModal cashSessionId={viewSession.id} onClose={() => setShowExchange(false)} onSaved={() => { setShowExchange(false); load(); }} />}
       {showClose && (
         <CloseCashModal
           expected={expectedBalance}

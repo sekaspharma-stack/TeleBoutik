@@ -2,6 +2,7 @@ import { useState, useEffect, useCallback } from 'react';
 import { Search, Receipt, Eye, X, Ban, ScanLine, ShieldCheck, ShieldAlert, ShieldQuestion, FileText } from 'lucide-react';
 import { query } from '../db/localDb';
 import { useAuth } from '../context/AuthContext';
+import { useLiveRefresh } from '../context/SyncContext';
 import { formatCurrency, formatDateTime, paymentLabel, canSeeMargin, canCancelSale } from '../lib/utils';
 import { cancelSale, getSaleLines, getSalePayments } from '../db/saleService';
 import { approveOwnerSensitiveAction } from '../db/operations';
@@ -33,6 +34,7 @@ export default function SalesPage() {
   }, [filter]);
 
   useEffect(() => { loadSales(); }, [loadSales]);
+  useLiveRefresh(loadSales);
 
   if (!user || !store) return null;
   const showMargin = canSeeMargin(user.role);

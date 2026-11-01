@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from 'react';
 import { ShieldCheck, Wrench, CreditCard, PackageSearch, BarChart3, Building2, Barcode, Camera, RefreshCw } from 'lucide-react';
 import { useAuth } from '../context/AuthContext';
+import { useLiveRefresh } from '../context/SyncContext';
 import { query } from '../db/localDb';
 import { getMarginByProduct, getConsolidatedSales } from '../db/operations';
 import WarrantyTab from '../components/ops/WarrantyTab';
@@ -40,7 +41,7 @@ export default function OperationsPage(){
    setCustomers(cs);setMargins(ms);setStoreSales(ss);setProducts(pr);
   } catch(e){setError(e instanceof Error?e.message:'Impossible de charger les modules.');} finally {setBusy(false);}
  },[store,fromDate,toDate,canManage]);
- useEffect(()=>{void load();},[load]);
+ useEffect(()=>{void load();},[load]);useLiveRefresh(load);
  const notify=(s:string)=>{setNotice(s);window.setTimeout(()=>setNotice(''),4000)};
  const onScan=useCallback((value:string)=>{setScanOpen(false);setLabelForm(f=>({...f,imei:value,barcode:value,sku:f.sku||value}));notify(`Code détecté : ${value}`);},[]);
  if(!user||!store)return null;

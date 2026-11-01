@@ -3,6 +3,7 @@ import { TrendingUp, ShoppingBag, Wallet, Banknote, Package, Users, AlertTriangl
 import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, PieChart, Pie, Cell, LineChart, Line } from 'recharts';
 import { query } from '../db/localDb';
 import { useAuth } from '../context/AuthContext';
+import { useLiveRefresh } from '../context/SyncContext';
 import { formatCurrency, canSeeMargin, paymentLabel } from '../lib/utils';
 import { MoneyCard, KpiCard } from '../components/MoneyCard';
 
@@ -174,6 +175,7 @@ export default function DashboardPage() {
   }, [period, customStart, customEnd, chartCurrency]);
 
   useEffect(() => { loadData(); }, [loadData]);
+  useLiveRefresh(loadData);
 
   if (!user || !store || !kpi) return null;
   const showMargin = canSeeMargin(user.role);

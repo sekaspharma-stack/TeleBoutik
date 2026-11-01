@@ -1,6 +1,7 @@
+import { useEffect, useRef } from 'react';
 import { create } from 'zustand';
 import { query } from '../db/localDb';
-import { flushPendingCloudTableWrites, syncPendingOps, isSyncing, pullCloudData, restorePendingCloudSync, type SyncProgress } from '../db/syncEngine';
+import { flushPendingCloudTableWrites, syncPendingOps, isSyncing, pullCloudData, restorePendingCloudSync, startRealtimeSync, stopRealtimeSync, type SyncProgress } from '../db/syncEngine';
 
 interface SyncState {
   isOnline: boolean;
@@ -11,6 +12,8 @@ interface SyncState {
   lastSyncResult: { synced: number; failed: number; errors?: string[] } | null;
   /** Incrémenté quand des données cloud ont été fusionnées en arrière-plan : les écrans se rafraîchissent. */
   dataVersion: number;
+  /** Incrémenté quand un AUTRE appareil a modifié des données (écoute temps réel). Les écrans rechargent leurs lectures sans être remontés. */
+  liveTick: number;
   setOnline: (online: boolean) => void;
   refreshPendingCount: () => Promise<void>;
   triggerSync: () => Promise<void>;
@@ -27,6 +30,7 @@ export const useSync = create<SyncState>((set, get) => ({
   progress: { completed: 0, total: 0, current: null },
   lastSyncResult: null,
   dataVersion: 0,
+  liveTick: 0,
   isRefreshing: false,
   refreshMessage: null,
 
@@ -142,6 +146,22 @@ export const useSync = create<SyncState>((set, get) => ({
 }));
 
 let watcherCleanup: (() => void) | null = null;
+let liveTickTimer: ReturnType<typeof setTimeout> | null = null;
+
+/**
+ * Hook des écrans : relance `reload` à chaque changement venu d'un autre appareil.
+ * Contrairement à `dataVersion`, l'écran n'est pas remonté : les fenêtres ouvertes et les champs en cours de saisie sont conservés.
+ */
+export function useLiveRefresh(reload: () => unknown): void {
+  const tick = useSync((state) => state.liveTick);
+  const latest = useRef(reload);
+  latest.current = reload;
+  const first = useRef(true);
+  useEffect(() => {
+    if (first.current) { first.current = false; return; }
+    void Promise.resolve(latest.current()).catch((error) => console.warn('Rechargement temps réel impossible :', error));
+  }, [tick]);
+}
 
 export function initSyncWatcher() {
   watcherCleanup?.();
@@ -153,6 +173,15 @@ export function initSyncWatcher() {
   window.addEventListener('online', goOnline);
   window.addEventListener('offline', goOffline);
   void useSync.getState().refreshPendingCount();
+
+  // Écoute temps réel : démarrée IMMÉDIATEMENT, sans attendre la file d'envoi ni le téléchargement complet.
+  startRealtimeSync(() => {
+    if (liveTickTimer) clearTimeout(liveTickTimer);
+    liveTickTimer = setTimeout(() => {
+      liveTickTimer = null;
+      useSync.setState((state) => ({ liveTick: state.liveTick + 1 }));
+    }, 150);
+  });
   if (navigator.onLine) {
     void restorePendingCloudSync()
       .then(() => flushPendingCloudTableWrites())
@@ -174,6 +203,8 @@ export function initSyncWatcher() {
     window.removeEventListener('online', goOnline);
     window.removeEventListener('offline', goOffline);
     window.clearInterval(poll);
+    stopRealtimeSync();
+    if (liveTickTimer) { clearTimeout(liveTickTimer); liveTickTimer = null; }
     watcherCleanup = null;
   };
   return watcherCleanup;

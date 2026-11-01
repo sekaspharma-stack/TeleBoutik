@@ -7,7 +7,9 @@ import {
   writeBatch,
   collection,
   getDocsFromServer,
+  onSnapshot,
   serverTimestamp,
+  type Unsubscribe,
   type WriteBatch,
 } from 'firebase/firestore';
 import { getDb, query, execute } from './localDb';
@@ -15,7 +17,7 @@ import { withTimeout } from '../lib/async';
 
 const CLOUD_WRITE_TIMEOUT_MS = 20000;
 const CLOUD_READ_TIMEOUT_MS = 25000;
-import type { SyncOp, Sale, SaleLine, SalePayment, StockMovement, CashMovement, JournalEntry, AuditLog } from '../types';
+import type { SyncOp, Sale, AuditLog } from '../types';
 
 type SyncResult = {
   synced: number;
@@ -23,120 +25,53 @@ type SyncResult = {
   errors: string[];
 };
 
+/** Copie une ligne SQL telle quelle (toutes les colonnes) en retirant les valeurs `undefined`. */
+function cleanRow(row: Record<string, unknown>): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(row)) if (value !== undefined) out[key] = value;
+  return out;
+}
+
+/**
+ * Envoie une vente et TOUTES ses lignes liées au cloud.
+ * Correctif : l'ancienne version recopiait une liste de champs fixe et écrasait les documents sans `merge`,
+ * ce qui supprimait `currency_code`, `original_amount` et `applied_rate` des mouvements de caisse et des
+ * paiements. Sur un autre appareil, un encaissement en CDF réapparaissait alors comme un montant USD erroné.
+ * Désormais : toutes les colonnes sont envoyées, et en `merge` pour ne jamais retirer un champ déjà présent.
+ */
 async function upsertSale(recordId: string, data: Sale): Promise<void> {
-  const lines = await query<SaleLine>('SELECT * FROM sale_lines WHERE sale_id = $1', [recordId]);
-  const payments = await query<SalePayment>('SELECT * FROM sale_payments WHERE sale_id = $1', [recordId]);
-  const stockMvts = await query<StockMovement>(
+  const saleRows = await query<Record<string, unknown>>('SELECT * FROM sales WHERE id = $1', [recordId]);
+  const saleRow = saleRows[0] ?? (data as unknown as Record<string, unknown>);
+  const lines = await query<Record<string, unknown>>('SELECT * FROM sale_lines WHERE sale_id = $1', [recordId]);
+  const payments = await query<Record<string, unknown>>('SELECT * FROM sale_payments WHERE sale_id = $1', [recordId]);
+  const stockMvts = await query<Record<string, unknown>>(
     "SELECT * FROM stock_movements WHERE reference_id = $1 AND reference_type IN ('sale','sale_cancel')",
     [recordId]
   );
-  const cashMvts = await query<CashMovement>(
+  const cashMvts = await query<Record<string, unknown>>(
     "SELECT * FROM cash_movements WHERE reference_id = $1",
     [recordId]
   );
-  const journalEntries = await query<JournalEntry>(
+  const journalEntries = await query<Record<string, unknown>>(
     "SELECT * FROM journal_entries WHERE reference_id = $1",
     [recordId]
   );
 
   const batch: WriteBatch = writeBatch(db);
+  const put = (collectionName: string, row: Record<string, unknown>, withSyncStamp = false) => {
+    const id = String(row.id ?? '');
+    if (!id) return;
+    const payload = cleanRow(row);
+    if (withSyncStamp) payload.synced_at = serverTimestamp();
+    batch.set(doc(db, collectionName, id), payload, { merge: true });
+  };
 
-  batch.set(doc(db, 'sales', data.id), {
-    id: data.id,
-    ticket_number: data.ticket_number,
-    store_id: data.store_id,
-    user_id: data.user_id,
-    customer_id: data.customer_id ?? null,
-    subtotal: data.subtotal,
-    discount: data.discount,
-    tax_amount: data.tax_amount,
-    total: data.total,
-    total_cost: data.total_cost,
-    status: data.status,
-    sale_date: data.sale_date,
-    notes: data.notes ?? null,
-    currency_code: data.currency_code ?? 'USD',
-    exchange_rate: data.exchange_rate ?? 1,
-    exchange_rate_buy: data.exchange_rate_buy ?? 1,
-    change_currency: data.change_currency ?? 'USD',
-    change_amount: data.change_amount ?? 0,
-    receipt_ref: data.receipt_ref ?? '',
-    receipt_hash: data.receipt_hash ?? '',
-    synced_at: serverTimestamp(),
-  });
-
-  for (const line of lines) {
-    batch.set(doc(db, 'sale_lines', line.id), {
-      id: line.id,
-      sale_id: line.sale_id,
-      variant_id: line.variant_id,
-      imei_unit_id: line.imei_unit_id ?? null,
-      product_name: line.product_name,
-      quantity: line.quantity,
-      unit_price: line.unit_price,
-      unit_cost: line.unit_cost,
-      discount: line.discount,
-      line_total: line.line_total,
-    });
-  }
-
-  for (const p of payments) {
-    batch.set(doc(db, 'sale_payments', p.id), {
-      id: p.id,
-      sale_id: p.sale_id,
-      payment_method: p.payment_method,
-      amount: p.amount,
-      reference: p.reference ?? null,
-    });
-  }
-
-  for (const sm of stockMvts) {
-    batch.set(doc(db, 'stock_movements', sm.id), {
-      id: sm.id,
-      variant_id: sm.variant_id,
-      imei_unit_id: sm.imei_unit_id ?? null,
-      movement_type: sm.movement_type,
-      direction: sm.direction,
-      quantity: sm.quantity,
-      unit_cost: sm.unit_cost,
-      reference_type: sm.reference_type,
-      reference_id: sm.reference_id ?? null,
-      user_id: sm.user_id,
-      reason: sm.reason,
-      created_at: sm.created_at,
-    });
-  }
-
-  for (const cm of cashMvts) {
-    batch.set(doc(db, 'cash_movements', cm.id), {
-      id: cm.id,
-      cash_session_id: cm.cash_session_id,
-      movement_type: cm.movement_type,
-      payment_method: cm.payment_method,
-      amount: cm.amount,
-      direction: cm.direction,
-      reference_type: cm.reference_type,
-      reference_id: cm.reference_id ?? null,
-      user_id: cm.user_id,
-      reason: cm.reason,
-      created_at: cm.created_at,
-    });
-  }
-
-  for (const je of journalEntries) {
-    batch.set(doc(db, 'journal_entries', je.id), {
-      id: je.id,
-      date: je.date,
-      account_debit: je.account_debit,
-      account_credit: je.account_credit,
-      amount: je.amount,
-      description: je.description,
-      reference_type: je.reference_type,
-      reference_id: je.reference_id,
-      user_id: je.user_id,
-      created_at: je.created_at,
-    });
-  }
+  put('sales', { ...saleRow, id: data.id ?? recordId, customer_id: saleRow.customer_id ?? null }, true);
+  for (const line of lines) put('sale_lines', line);
+  for (const payment of payments) put('sale_payments', payment);
+  for (const movement of stockMvts) put('stock_movements', movement);
+  for (const movement of cashMvts) put('cash_movements', movement);
+  for (const entry of journalEntries) put('journal_entries', entry);
 
   await batch.commit();
 }
@@ -365,6 +300,13 @@ const TABLE_COLLECTIONS: Array<{ table: string; collection: string }> = [
   { table: 'purchase_lines', collection: 'purchase_lines' },
   { table: 'inventory_sessions', collection: 'inventory_sessions' },
   { table: 'trade_ins', collection: 'trade_ins' },
+  // Modules ajoutés plus tard : sans ces entrées, les dettes clients, garanties et réparations
+  // restaient uniquement sur l'appareil qui les avait créés.
+  { table: 'customer_debt_ledger', collection: 'customer_debt_ledger' },
+  { table: 'debt_reminders', collection: 'debt_reminders' },
+  { table: 'warranty_records', collection: 'warranty_records' },
+  { table: 'repair_records', collection: 'repair_records' },
+  { table: 'manager_approvals', collection: 'manager_approvals' },
 ];
 
 const TABLE_BY_NAME = new Map<string, { table: string; collection: string }>(TABLE_COLLECTIONS.map((entry) => [entry.table, entry] as const));
@@ -390,7 +332,7 @@ export function scheduleLocalTableSync(
   }
   if (typeof navigator !== 'undefined' && !navigator.onLine) return;
   if (tableSyncTimer) clearTimeout(tableSyncTimer);
-  tableSyncTimer = setTimeout(() => { void flushScheduledTableSync(); }, 1200);
+  tableSyncTimer = setTimeout(() => { void flushScheduledTableSync(); }, 150);
 }
 
 /** Restore the persisted queue after a refresh or an offline session. */
@@ -462,7 +404,7 @@ async function flushScheduledTableSync(): Promise<void> {
     tableSyncRunning = false;
     if ((pendingFullTableSync.size > 0 || pendingRecordSync.size > 0) && (typeof navigator === 'undefined' || navigator.onLine)) {
       if (tableSyncTimer) clearTimeout(tableSyncTimer);
-      tableSyncTimer = setTimeout(() => { void flushScheduledTableSync(); }, 5000);
+      tableSyncTimer = setTimeout(() => { void flushScheduledTableSync(); }, 400);
     }
   }
 }
@@ -541,6 +483,87 @@ function cloudRecordId(table: string, data: Record<string, unknown>, docId: stri
   return String(data.id ?? docId);
 }
 
+type LocalDatabase = Awaited<ReturnType<typeof getDb>>;
+type LocalTx = Parameters<Parameters<LocalDatabase['transaction']>[0]>[0];
+
+/** Clés `cloud_pending:<table>:<id>` des lignes locales pas encore envoyées : elles ne doivent jamais être écrasées ni supprimées. */
+async function loadPendingKeys(database: LocalDatabase): Promise<Set<string>> {
+  const pendingRows = await database.query<{ key: string; value: string }>(
+    "SELECT key, value FROM app_meta WHERE key LIKE 'cloud_pending:%' OR key LIKE 'cloud_pending_full:%'"
+  );
+  const pendingKeys = new Set(pendingRows.rows.map((row) => row.key));
+
+  // Le flux de vente principal utilise sync_ops plutôt que app_meta. On protège aussi une vente hors-ligne
+  // encore en attente et ses lignes de comptabilité créées localement.
+  const pendingOps = await database.query<{ entity: string; record_id: string }>(
+    "SELECT entity, record_id FROM sync_ops WHERE status IN ('pending', 'conflict')"
+  );
+  for (const op of pendingOps.rows) {
+    pendingKeys.add(`cloud_pending:${op.entity}:${op.record_id}`);
+    if (op.entity !== 'sales') continue;
+    for (const child of [
+      { table: 'sale_lines', sql: 'SELECT id FROM sale_lines WHERE sale_id = $1' },
+      { table: 'sale_payments', sql: 'SELECT id FROM sale_payments WHERE sale_id = $1' },
+      { table: 'stock_movements', sql: "SELECT id FROM stock_movements WHERE reference_id = $1 AND reference_type IN ('sale','sale_cancel')" },
+      { table: 'cash_movements', sql: 'SELECT id FROM cash_movements WHERE reference_id = $1' },
+      { table: 'journal_entries', sql: 'SELECT id FROM journal_entries WHERE reference_id = $1' },
+    ]) {
+      const childRows = await database.query<{ id: string }>(child.sql, [op.record_id]);
+      for (const childRow of childRows.rows) pendingKeys.add(`cloud_pending:${child.table}:${childRow.id}`);
+    }
+  }
+  return pendingKeys;
+}
+
+const allowedColumnsCache = new Map<string, Set<string>>();
+async function allowedColumnsFor(database: LocalDatabase, table: string): Promise<Set<string>> {
+  const cached = allowedColumnsCache.get(table);
+  if (cached) return cached;
+  const schema = await database.query<{ column_name: string }>(
+    'SELECT column_name FROM information_schema.columns WHERE table_name = $1',
+    [table]
+  );
+  const columns = new Set(schema.rows.map((row) => row.column_name));
+  if (columns.size > 0) allowedColumnsCache.set(table, columns);
+  return columns;
+}
+
+/** Insère ou met à jour UNE ligne cloud dans la base locale (tolérant : un SAVEPOINT isole une ligne invalide). */
+async function importCloudRow(
+  tx: LocalTx,
+  table: string,
+  id: string,
+  data: Record<string, unknown>,
+  allowedColumns: Set<string>,
+  label: string
+): Promise<boolean> {
+  const record: Record<string, unknown> = { ...data, id };
+  delete record.synced_at;
+  const columns = Object.keys(record).filter((key) => allowedColumns.has(key) && /^[a-z_][a-z0-9_]*$/i.test(key));
+  if (!columns.includes('id')) columns.unshift('id');
+  const values = columns.map((key) => toSqlValue(key, record[key]));
+  const placeholders = columns.map((_, index) => `$${index + 1}`).join(', ');
+  const updates = columns.filter((key) => key !== 'id').map((key) => `${key} = EXCLUDED.${key}`).join(', ');
+  const conflictClause = updates ? `ON CONFLICT (id) DO UPDATE SET ${updates}` : 'ON CONFLICT (id) DO NOTHING';
+  await tx.query('SAVEPOINT import_row');
+  try {
+    await tx.query(`INSERT INTO ${table} (${columns.join(', ')}) VALUES (${placeholders}) ${conflictClause}`, values);
+    await tx.query('RELEASE SAVEPOINT import_row');
+    return true;
+  } catch (error) {
+    await tx.query('ROLLBACK TO SAVEPOINT import_row');
+    console.warn(`Could not import ${label}:`, error);
+    return false;
+  }
+}
+
+/**
+ * Lignes appliquées par l'écoute temps réel PENDANT qu'un téléchargement complet est en cours.
+ * Le téléchargement complet a lu le serveur un peu plus tôt : il ne doit ni écraser ces lignes plus récentes
+ * ni les supprimer comme « absentes du cloud ».
+ */
+const liveTouchedDuringPull = new Set<string>();
+
 export type CloudPullResult = {
   available: boolean;
   failedCollections: string[];
@@ -562,7 +585,7 @@ export function pullCloudData(): Promise<CloudPullResult> {
       // Le téléchargement prioritaire (boutique + comptes) passe toujours en premier.
       if (priorityInFlight) await priorityInFlight.catch(() => undefined);
       return pullCloudDataInner();
-    })().finally(() => { pullInFlight = null; });
+    })().finally(() => { pullInFlight = null; if (!priorityInFlight) liveTouchedDuringPull.clear(); });
   }
   return pullInFlight;
 }
@@ -576,7 +599,7 @@ const PRIORITY_COLLECTIONS = ['stores', 'app_users'];
  */
 export function pullPriorityData(): Promise<CloudPullResult> {
   if (!priorityInFlight) {
-    priorityInFlight = pullCloudDataInner(PRIORITY_COLLECTIONS, 12000).finally(() => { priorityInFlight = null; });
+    priorityInFlight = pullCloudDataInner(PRIORITY_COLLECTIONS, 12000).finally(() => { priorityInFlight = null; if (!pullInFlight) liveTouchedDuringPull.clear(); });
   }
   return priorityInFlight;
 }
@@ -633,30 +656,7 @@ async function pullCloudDataInner(only?: string[], readTimeoutMs: number = CLOUD
     return { available: false, failedCollections, reconciledTables: [], skippedReason: 'Aucune collection cloud n’a pu être lue depuis le serveur' };
   }
 
-  const pendingRows = await database.query<{ key: string; value: string }>(
-    "SELECT key, value FROM app_meta WHERE key LIKE 'cloud_pending:%' OR key LIKE 'cloud_pending_full:%'"
-  );
-  const pendingKeys = new Set(pendingRows.rows.map((row) => row.key));
-
-  // The main POS sale flow uses sync_ops rather than app_meta. Protect any still-pending
-  // offline sale and its locally-created child ledger rows from stale cloud overwrites.
-  const pendingOps = await database.query<{ entity: string; record_id: string }>(
-    "SELECT entity, record_id FROM sync_ops WHERE status IN ('pending', 'conflict')"
-  );
-  for (const op of pendingOps.rows) {
-    pendingKeys.add(`cloud_pending:${op.entity}:${op.record_id}`);
-    if (op.entity !== 'sales') continue;
-    for (const child of [
-      { table: 'sale_lines', sql: 'SELECT id FROM sale_lines WHERE sale_id = $1' },
-      { table: 'sale_payments', sql: 'SELECT id FROM sale_payments WHERE sale_id = $1' },
-      { table: 'stock_movements', sql: "SELECT id FROM stock_movements WHERE reference_id = $1 AND reference_type IN ('sale','sale_cancel')" },
-      { table: 'cash_movements', sql: 'SELECT id FROM cash_movements WHERE reference_id = $1' },
-      { table: 'journal_entries', sql: 'SELECT id FROM journal_entries WHERE reference_id = $1' },
-    ]) {
-      const childRows = await database.query<{ id: string }>(child.sql, [op.record_id]);
-      for (const childRow of childRows.rows) pendingKeys.add(`cloud_pending:${child.table}:${childRow.id}`);
-    }
-  }
+  const pendingKeys = await loadPendingKeys(database);
 
   // A completely empty cloud identity with existing local business data may indicate
   // a wrong Firebase project/configuration. Never erase that local data automatically.
@@ -681,15 +681,10 @@ async function pullCloudDataInner(only?: string[], readTimeoutMs: number = CLOUD
 
     if (pendingKeys.has(`cloud_pending_full:${entry.table}`)) continue;
 
-    const schema = await database.query<{ column_name: string }>(
-      'SELECT column_name FROM information_schema.columns WHERE table_name = $1',
-      [entry.table]
-    );
-    const allowedColumns = new Set(schema.rows.map((row) => row.column_name));
+    const allowedColumns = await allowedColumnsFor(database, entry.table);
 
     // Une transaction par collection : PGlite/IndexedDB n'écrit sur disque qu'une fois au COMMIT
     // (avant : une écriture disque par document, cause principale de la lenteur au démarrage).
-    // Un SAVEPOINT par ligne conserve la tolérance aux lignes invalides.
     await database.transaction(async (tx) => {
       // Réglages : les documents à id canonique (« setting:<clé> ») passent en dernier et l'emportent sur d'anciens doublons.
       const docs = entry.table === 'settings'
@@ -699,27 +694,8 @@ async function pullCloudDataInner(only?: string[], readTimeoutMs: number = CLOUD
         const data = docSnap.data();
         const id = cloudRecordId(entry.table, data, docSnap.id);
         if (pendingKeys.has(`cloud_pending:${entry.table}:${id}`)) continue;
-        const record: Record<string, unknown> = { ...data, id };
-        delete record.synced_at;
-        const columns = Object.keys(record).filter((key) => allowedColumns.has(key) && /^[a-z_][a-z0-9_]*$/i.test(key));
-        if (!columns.includes('id')) columns.unshift('id');
-        const values = columns.map((key) => toSqlValue(key, record[key]));
-        const placeholders = columns.map((_, index) => `$${index + 1}`).join(', ');
-        const updates = columns.filter((key) => key !== 'id').map((key) => `${key} = EXCLUDED.${key}`).join(', ');
-        const conflictClause = updates
-          ? `ON CONFLICT (id) DO UPDATE SET ${updates}`
-          : 'ON CONFLICT (id) DO NOTHING';
-        await tx.query('SAVEPOINT import_row');
-        try {
-          await tx.query(
-            `INSERT INTO ${entry.table} (${columns.join(', ')}) VALUES (${placeholders}) ${conflictClause}`,
-            values
-          );
-          await tx.query('RELEASE SAVEPOINT import_row');
-        } catch (error) {
-          await tx.query('ROLLBACK TO SAVEPOINT import_row');
-          console.warn(`Could not import ${entry.collection}/${docSnap.id}:`, error);
-        }
+        if (liveTouchedDuringPull.has(`${entry.table}:${id}`)) continue;
+        await importCloudRow(tx, entry.table, id, data, allowedColumns, `${entry.collection}/${docSnap.id}`);
       }
     });
     tablesToReconcile.push({ table: entry.table, remoteIds });
@@ -733,7 +709,7 @@ async function pullCloudDataInner(only?: string[], readTimeoutMs: number = CLOUD
     const localRows = await database.query<{ id: string }>(`SELECT id FROM ${entry.table}`);
     const staleIds = localRows.rows
       .map((row) => String(row.id))
-      .filter((id) => !entry.remoteIds.has(id) && !pendingKeys.has(`cloud_pending:${entry.table}:${id}`));
+      .filter((id) => !entry.remoteIds.has(id) && !pendingKeys.has(`cloud_pending:${entry.table}:${id}`) && !liveTouchedDuringPull.has(`${entry.table}:${id}`));
     if (staleIds.length > 0) {
       await database.transaction(async (tx) => {
         for (const id of staleIds) await tx.query(`DELETE FROM ${entry.table} WHERE id = $1`, [id]);
@@ -743,4 +719,165 @@ async function pullCloudDataInner(only?: string[], readTimeoutMs: number = CLOUD
   }
 
   return { available: true, failedCollections, reconciledTables };
+}
+
+
+/* -------------------------------------------------------------------------------------------------
+ * SYNCHRONISATION TEMPS RÉEL (Firestore onSnapshot)
+ *
+ * Avant : un appareil ne voyait les changements des autres qu'au prochain téléchargement complet
+ * (démarrage, bouton d'actualisation, retour réseau). Une vendeuse qui ouvrait sa caisse restait
+ * invisible chez le propriétaire.
+ * Maintenant : chaque collection est écoutée en continu. Dès qu'un autre appareil écrit, la ligne est
+ * appliquée dans la base locale (PGlite) en quelques centaines de millisecondes, puis les écrans sont
+ * rechargés. Avec le cache persistant de Firestore, un rechargement de page ne retélécharge que ce qui a changé.
+ * ------------------------------------------------------------------------------------------------- */
+
+/** Historique d'audit : volumineux et non affiché en direct. Il reste synchronisé par le téléchargement complet. */
+const LIVE_EXCLUDED_COLLECTIONS = new Set(['audit_log']);
+const LIVE_FLUSH_DELAY_MS = 120;
+const LIVE_RETRY_DELAY_MS = 1500;
+const LIVE_MAX_ATTEMPTS = 8;
+
+type LiveChange = {
+  table: string;
+  id: string;
+  type: 'upsert' | 'delete';
+  data: Record<string, unknown>;
+  label: string;
+  attempts: number;
+};
+
+const liveBuffer = new Map<string, LiveChange>();
+let liveUnsubscribes: Unsubscribe[] = [];
+let liveNotify: ((tables: string[]) => void) | null = null;
+let liveTimer: ReturnType<typeof setTimeout> | null = null;
+let liveFlushing = false;
+
+function scheduleLiveFlush(delay: number): void {
+  if (liveTimer) clearTimeout(liveTimer);
+  liveTimer = setTimeout(() => { liveTimer = null; void flushLiveChanges(); }, delay);
+}
+
+async function flushLiveChanges(): Promise<void> {
+  if (liveFlushing) { scheduleLiveFlush(LIVE_FLUSH_DELAY_MS); return; }
+  if (liveBuffer.size === 0) return;
+  liveFlushing = true;
+  const retry: LiveChange[] = [];
+  const touched = new Set<string>();
+  const changes = [...liveBuffer.values()];
+  liveBuffer.clear();
+  try {
+    const database = await getDb();
+    const pendingKeys = await loadPendingKeys(database);
+    const pullRunning = Boolean(pullInFlight || priorityInFlight);
+
+    // 1) Créations / modifications, parents avant enfants (clés étrangères).
+    for (const entry of TABLE_COLLECTIONS) {
+      const upserts = changes.filter((change) => change.table === entry.table && change.type === 'upsert'
+        && !pendingKeys.has(`cloud_pending:${entry.table}:${change.id}`));
+      if (upserts.length === 0) continue;
+      const allowedColumns = await allowedColumnsFor(database, entry.table);
+      await database.transaction(async (tx) => {
+        for (const change of upserts) {
+          const ok = await importCloudRow(tx, entry.table, change.id, change.data, allowedColumns, change.label);
+          if (ok) {
+            touched.add(entry.table);
+            if (pullRunning) liveTouchedDuringPull.add(`${entry.table}:${change.id}`);
+          } else {
+            retry.push(change); // le plus souvent : le parent (clé étrangère) n'est pas encore arrivé
+          }
+        }
+      });
+    }
+
+    // 2) Suppressions, enfants avant parents.
+    for (const entry of [...TABLE_COLLECTIONS].reverse()) {
+      const deletions = changes.filter((change) => change.table === entry.table && change.type === 'delete'
+        && !pendingKeys.has(`cloud_pending:${entry.table}:${change.id}`));
+      if (deletions.length === 0) continue;
+      await database.transaction(async (tx) => {
+        for (const change of deletions) {
+          await tx.query('SAVEPOINT live_delete');
+          try {
+            await tx.query(`DELETE FROM ${entry.table} WHERE id = $1`, [change.id]);
+            await tx.query('RELEASE SAVEPOINT live_delete');
+            touched.add(entry.table);
+            if (pullRunning) liveTouchedDuringPull.add(`${entry.table}:${change.id}`);
+          } catch (error) {
+            await tx.query('ROLLBACK TO SAVEPOINT live_delete');
+            console.warn(`Could not apply live delete ${change.label}:`, error);
+          }
+        }
+      });
+    }
+  } catch (error) {
+    // Échec global (base verrouillée, erreur de transaction…) : tout est remis en file pour un nouvel essai.
+    console.warn('Live cloud apply failed, will retry:', error);
+    for (const change of changes) if (!retry.includes(change)) retry.push(change);
+  } finally {
+    liveFlushing = false;
+  }
+
+  // Les lignes refusées (parent manquant) sont réessayées : le parent arrive en général dans la seconde qui suit.
+  for (const change of liveNotify ? retry : []) {
+    const key = `${change.table}\u0000${change.id}`;
+    if (change.attempts + 1 >= LIVE_MAX_ATTEMPTS || liveBuffer.has(key)) continue;
+    liveBuffer.set(key, { ...change, attempts: change.attempts + 1 });
+  }
+  if (liveBuffer.size > 0) scheduleLiveFlush(retry.length > 0 ? LIVE_RETRY_DELAY_MS : LIVE_FLUSH_DELAY_MS);
+  if (touched.size > 0) {
+    try { liveNotify?.([...touched]); } catch (error) { console.warn('Live notify failed:', error); }
+  }
+}
+
+/** Arrête l'écoute temps réel (déconnexion, changement de boutique). */
+export function stopRealtimeSync(): void {
+  for (const unsubscribe of liveUnsubscribes) {
+    try { unsubscribe(); } catch { /* écoute déjà fermée */ }
+  }
+  liveUnsubscribes = [];
+  liveNotify = null;
+  if (liveTimer) { clearTimeout(liveTimer); liveTimer = null; }
+  liveBuffer.clear();
+}
+
+/**
+ * Démarre l'écoute temps réel de toutes les collections métier.
+ * `onChange` reçoit la liste des tables locales réellement modifiées par un autre appareil.
+ */
+export function startRealtimeSync(onChange: (tables: string[]) => void): () => void {
+  stopRealtimeSync();
+  if (!isFirebaseConfigured) return () => undefined;
+  liveNotify = onChange;
+
+  for (const entry of TABLE_COLLECTIONS) {
+    if (LIVE_EXCLUDED_COLLECTIONS.has(entry.collection)) continue;
+    const unsubscribe = onSnapshot(
+      collection(db, entry.collection),
+      (snapshot) => {
+        let queued = false;
+        for (const change of snapshot.docChanges()) {
+          const docSnap = change.doc;
+          // Écho de NOS propres écritures : la base locale est déjà à jour (et prioritaire).
+          if (docSnap.metadata.hasPendingWrites) continue;
+          const data = docSnap.data();
+          const id = cloudRecordId(entry.table, data, docSnap.id);
+          liveBuffer.set(`${entry.table}\u0000${id}`, {
+            table: entry.table,
+            id,
+            type: change.type === 'removed' ? 'delete' : 'upsert',
+            data,
+            label: `${entry.collection}/${docSnap.id}`,
+            attempts: 0,
+          });
+          queued = true;
+        }
+        if (queued) scheduleLiveFlush(LIVE_FLUSH_DELAY_MS);
+      },
+      (error) => console.warn(`Écoute temps réel indisponible pour ${entry.collection}:`, error)
+    );
+    liveUnsubscribes.push(unsubscribe);
+  }
+  return stopRealtimeSync;
 }

@@ -4,6 +4,7 @@ import { getDb, query, queryOne, execute, generateId, now } from '../db/localDb'
 import { addAuditLog } from '../db/audit';
 import { scheduleLocalTableSync } from '../db/syncEngine';
 import { useAuth } from '../context/AuthContext';
+import { useLiveRefresh } from '../context/SyncContext';
 import { formatCurrency, formatDateTime } from '../lib/utils';
 import type { CashSession, TelecomTransaction } from '../types';
 import CustomerSelect, { type SelectedCustomer } from '../components/CustomerSelect';
@@ -64,6 +65,7 @@ export default function TelecomSalesPage() {
     setBalances(next);
   }, [user, store]);
   useEffect(() => { void load(); }, [load]);
+  useLiveRefresh(load);
 
   const visibleRows = useMemo(() => {
     const needle = search.trim().toLowerCase();
