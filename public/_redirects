@@ -1,0 +1,2 @@
+# Cloudflare Pages SPA fallback: keep client-side routes working on refresh
+/* /index.html 200
